@@ -47,6 +47,13 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     HAS_YOLO = False
 
+try:
+    from ultralytics.models.sam import SAM3SemanticPredictor
+
+    HAS_SAM3 = True
+except ImportError:  # pragma: no cover - optional dependency
+    HAS_SAM3 = False
+
 # Remap coordinate maps cached per worker process.
 # Keyed by (direction, crop_size, fov_deg, yaw_offset, flip_vertical, equirect_w, equirect_h).
 _remap_cache: Dict[tuple, Tuple[np.ndarray, np.ndarray]] = {}
@@ -54,12 +61,31 @@ _remap_cache: Dict[tuple, Tuple[np.ndarray, np.ndarray]] = {}
 # YOLO model initialized once per worker process via _init_yolo_worker().
 _worker_yolo_model = None
 
+# SAM3 predictor initialized once per worker process via _init_sam3_worker().
+_worker_sam3_predictor = None
+
 
 def _init_yolo_worker(model_path: str) -> None:
     """Load the YOLO segmentation model once per worker process."""
     global _worker_yolo_model
     if HAS_YOLO:
         _worker_yolo_model = YOLO(model_path)
+
+
+def _init_sam3_worker(model_path: str, conf: float = 0.25, half: bool = True) -> None:
+    """Load the SAM3 semantic predictor once per worker process."""
+    global _worker_sam3_predictor
+    if HAS_SAM3:
+        overrides = dict(
+            conf=conf,
+            task="segment",
+            mode="predict",
+            model=model_path,
+            half=half,
+            verbose=False,
+            save=False,
+        )
+        _worker_sam3_predictor = SAM3SemanticPredictor(overrides=overrides)
 
 
 def find_param(calib_xml: ET.Element, param_name: str) -> float:
@@ -389,6 +415,110 @@ def generate_mask_and_save(
     return (image_path, output_mask_path)
 
 
+def create_mask_from_sam3(
+    image_path: str,
+    predictor: Any,
+    concepts: list,
+    invert_mask: bool = False,
+    mask_overexposure: bool = False,
+    overexposure_threshold: int = 250,
+    overexposure_dilate: int = 5,
+) -> Image.Image:
+    """Create a binary mask using SAM3 text-prompted segmentation.
+
+    Args:
+        image_path: Path to the equirectangular image.
+        predictor: SAM3SemanticPredictor instance (pre-loaded in worker).
+        concepts: List of text concepts to segment (e.g. ["person", "tourist"]).
+        invert_mask: If True, object=white(255), background=black(0).
+                     If False (default), object=black(0), background=white(255) for 3DGS.
+        mask_overexposure: If True, also mask overexposed pixels.
+        overexposure_threshold: Per-channel threshold for overexposure detection.
+        overexposure_dilate: Dilation radius for overexposure mask.
+    """
+    import gc
+    import torch
+
+    img = cv2.imread(image_path)
+    h, w = img.shape[:2]
+
+    predictor.set_image(image_path)
+    results = predictor(text=concepts)
+
+    combined = np.zeros((h, w), dtype=np.uint8)
+
+    if results and results[0].masks is not None:
+        for mask_tensor in results[0].masks.data:
+            mask_np = mask_tensor.cpu().numpy().astype(np.uint8) * 255
+            if mask_np.shape != (h, w):
+                mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
+            combined = np.maximum(combined, mask_np)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        combined = cv2.dilate(combined, kernel, iterations=1)
+
+    if mask_overexposure:
+        image = Image.open(image_path)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        overexposure = create_overexposure_mask(
+            image,
+            threshold=overexposure_threshold,
+            dilate_pixels=overexposure_dilate,
+        )
+        combined = np.maximum(combined, overexposure)
+
+    # Release GPU memory between frames to avoid OOM on large datasets.
+    del results
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if not invert_mask:
+        combined = 255 - combined
+
+    return Image.fromarray(combined, mode="L")
+
+
+def generate_mask_and_save_sam3(
+    image_path: str,
+    output_mask_path: str,
+    concepts: list,
+    invert_mask: bool = False,
+    mask_overexposure: bool = False,
+    overexposure_threshold: int = 250,
+    overexposure_dilate: int = 5,
+) -> Tuple[str, str]:
+    """Generate a SAM3 text-prompted mask and save to file (for parallel processing).
+
+    Uses the SAM3 predictor pre-loaded per worker via _init_sam3_worker().
+    NOTE: SAM3 requires max_workers=1 to avoid GPU OOM (model is ~3.4 GB / ~1.7 GB FP16).
+
+    Args:
+        image_path: Path to the equirectangular image.
+        output_mask_path: Path to save the mask.
+        concepts: List of text concepts to segment.
+        invert_mask: Whether to invert the mask.
+        mask_overexposure: Whether to also mask overexposed pixels.
+        overexposure_threshold: Pixel value threshold for overexposure detection.
+        overexposure_dilate: Dilation radius for overexposure mask.
+
+    Returns:
+        Tuple of (image_path, output_mask_path)
+    """
+    if not HAS_SAM3 or _worker_sam3_predictor is None:
+        raise RuntimeError("SAM3 predictor not initialized in worker process")
+
+    mask = create_mask_from_sam3(
+        image_path, _worker_sam3_predictor, concepts, invert_mask,
+        mask_overexposure=mask_overexposure,
+        overexposure_threshold=overexposure_threshold,
+        overexposure_dilate=overexposure_dilate,
+    )
+    mask.save(output_mask_path)
+    return (image_path, output_mask_path)
+
+
 def crop_and_save_image(
     image_path: str,
     direction: str,
@@ -546,6 +676,7 @@ def convert_metashape_to_colmap(
     skip_component_transform_for_ply: bool = True,
     skip_directions: Optional[list] = None,
     generate_masks: bool = False,
+    mask_engine: str = "yolo",
     yolo_model_path: str = "yolo11n-seg.pt",
     yolo_conf: float = 0.25,
     invert_mask: bool = False,
@@ -556,6 +687,10 @@ def convert_metashape_to_colmap(
     mask_overexposure: bool = False,
     overexposure_threshold: int = 250,
     overexposure_dilate: int = 5,
+    sam3_model_path: str = "sam3.pt",
+    sam3_concepts: Optional[list] = None,
+    sam3_conf: float = 0.25,
+    sam3_half: bool = True,
 ) -> Dict[str, Any]:
     """Convert Metashape equirectangular data to COLMAP format.
     
@@ -568,6 +703,8 @@ def convert_metashape_to_colmap(
         range_images: Tuple of (start_index, end_index) to process only a range of images.
                       E.g., (10, 50) processes images from index 10 to 50 (inclusive).
                       If None, processes all images (up to max_images if specified).
+        mask_engine: Segmentation backend to use. "yolo" uses YOLO class-based detection;
+                     "sam3" uses SAM3 open-vocabulary text-prompted segmentation.
         yolo_classes: List of YOLO class IDs to include in mask. If None, uses [0] (person only).
                       Common COCO classes: 0=person, 2=car, 3=motorcycle, 5=bus, 7=truck, etc.
         yolo_conf: Minimum YOLO confidence score (0.0-1.0) to keep detections.
@@ -576,6 +713,12 @@ def convert_metashape_to_colmap(
         mask_overexposure: If True, also mask white-blown-out (overexposed) pixels.
         overexposure_threshold: Pixel value threshold (0-255) for overexposure detection.
         overexposure_dilate: Dilation radius (pixels) for overexposure mask.
+        sam3_model_path: Path to sam3.pt model file (must be downloaded manually).
+        sam3_concepts: List of text concepts to segment with SAM3.
+                       Defaults to ["person", "people", "tourist", "selfie stick",
+                       "moving car", "motorbike", "bicycle"] if None.
+        sam3_conf: Minimum SAM3 confidence score (0.0-1.0) to keep detections.
+        sam3_half: If True, run SAM3 in FP16 mode to reduce VRAM (~1.7 GB vs ~3.4 GB).
     """
     if output_dir is None:
         output_dir = xml_path.parent
@@ -589,15 +732,33 @@ def convert_metashape_to_colmap(
     tmp_masks_dir = None
     yolo_model = None
     if generate_masks:
-        if not HAS_YOLO:
-            raise ImportError("ultralytics is required for mask generation. Install with: pip install ultralytics")
+        if mask_engine == "sam3":
+            if not HAS_SAM3:
+                raise ImportError(
+                    "ultralytics >= 8.3.237 with SAM3 support is required for SAM3 mask generation. "
+                    "Install with: pip install -U ultralytics\n"
+                    "Also ensure the ultralytics CLIP fork is installed:\n"
+                    "  pip uninstall clip -y && pip install git+https://github.com/ultralytics/CLIP.git"
+                )
+        else:
+            if not HAS_YOLO:
+                raise ImportError("ultralytics is required for mask generation. Install with: pip install ultralytics")
         masks_output_dir = output_dir / "masks"
         masks_output_dir.mkdir(parents=True, exist_ok=True)
         tmp_masks_dir = output_dir / "tmp"
         tmp_masks_dir.mkdir(parents=True, exist_ok=True)
-        if verbose:
-            print(f"Loading YOLO model: {yolo_model_path}")
-        yolo_model = YOLO(yolo_model_path)
+        if mask_engine == "yolo":
+            if verbose:
+                print(f"Loading YOLO model: {yolo_model_path}")
+            yolo_model = YOLO(yolo_model_path)
+        else:
+            if verbose:
+                print(f"Loading SAM3 model: {sam3_model_path} (this may take a moment)")
+            if sam3_concepts is None:
+                sam3_concepts = [
+                    "person", "people", "tourist", "selfie stick",
+                    "moving car", "motorbike", "bicycle",
+                ]
 
     if verbose:
         print(f"Parsing Metashape XML: {xml_path}")
@@ -741,71 +902,126 @@ def convert_metashape_to_colmap(
 
     # Generate masks in parallel if requested
     if generate_masks and equirect_images_to_process:
-        if verbose:
-            print(f"Generating {len(equirect_images_to_process)} masks with YOLO (parallel)...")
-        
-        mask_generation_tasks = []
-        for src_image_path, base_name in equirect_images_to_process:
-            tmp_mask_name = f"{base_name}_mask.png"
-            tmp_mask_path = str(tmp_masks_dir / tmp_mask_name)
-            mask_generation_tasks.append((
-                src_image_path, tmp_mask_path, yolo_conf, invert_mask, yolo_classes,
-                mask_overexposure, overexposure_threshold, overexposure_dilate,
-            ))
-        
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            initializer=_init_yolo_worker,
-            initargs=(yolo_model_path,),
-        ) as executor:
-            futures_to_src = {}
-            for task in mask_generation_tasks:
-                future = executor.submit(
-                    generate_mask_and_save,
-                    task[0],
-                    task[1],
-                    task[2],
-                    task[3],
-                    task[4],
-                    task[5],
-                    task[6],
-                    task[7],
+        if mask_engine == "sam3":
+            if verbose:
+                print(
+                    f"Generating {len(equirect_images_to_process)} masks with SAM3 "
+                    f"(sequential, max_workers=1 to avoid GPU OOM)..."
                 )
-                futures_to_src[future] = task[0]
+            mask_generation_tasks = []
+            for src_image_path, base_name in equirect_images_to_process:
+                tmp_mask_name = f"{base_name}_mask.png"
+                tmp_mask_path = str(tmp_masks_dir / tmp_mask_name)
+                mask_generation_tasks.append((
+                    src_image_path, tmp_mask_path, sam3_concepts,
+                    invert_mask, mask_overexposure, overexposure_threshold, overexposure_dilate,
+                ))
 
-            total_masks = len(futures_to_src)
-            completed_masks = 0
-            report_interval = max(1, total_masks // 20)
-            next_report = report_interval
-            use_inline_progress = sys.stdout.isatty()
-
-            if verbose and use_inline_progress:
-                print(f"  Mask progress: 0/{total_masks} (0.0%)", end="\r", flush=True)
-            
-            for future in as_completed(futures_to_src):
-                completed_masks += 1
-                try:
-                    image_path, mask_path = future.result()
-                    equirect_mask_paths[image_path] = mask_path
-                except Exception as exc:
-                    if verbose:
-                        print(f"  Error generating mask: {exc}")
-
-                if verbose and (completed_masks >= next_report or completed_masks == total_masks):
-                    progress_msg = (
-                        f"  Mask progress: {completed_masks}/{total_masks} "
-                        f"({(completed_masks / total_masks) * 100:.1f}%)"
+            with ProcessPoolExecutor(
+                max_workers=1,
+                initializer=_init_sam3_worker,
+                initargs=(sam3_model_path, sam3_conf, sam3_half),
+            ) as executor:
+                futures_to_src = {}
+                for task in mask_generation_tasks:
+                    future = executor.submit(
+                        generate_mask_and_save_sam3,
+                        task[0], task[1], task[2], task[3], task[4], task[5], task[6],
                     )
-                    if use_inline_progress:
-                        print(progress_msg, end="\r", flush=True)
-                    else:
-                        print(progress_msg)
-                    while next_report <= completed_masks:
-                        next_report += report_interval
+                    futures_to_src[future] = task[0]
 
-            if verbose and use_inline_progress:
-                print()
-        
+                total_masks = len(futures_to_src)
+                completed_masks = 0
+                report_interval = max(1, total_masks // 20)
+                next_report = report_interval
+                use_inline_progress = sys.stdout.isatty()
+
+                if verbose and use_inline_progress:
+                    print(f"  Mask progress: 0/{total_masks} (0.0%)", end="\r", flush=True)
+
+                for future in as_completed(futures_to_src):
+                    completed_masks += 1
+                    try:
+                        image_path, mask_path = future.result()
+                        equirect_mask_paths[image_path] = mask_path
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  Error generating SAM3 mask: {exc}")
+
+                    if verbose and (completed_masks >= next_report or completed_masks == total_masks):
+                        progress_msg = (
+                            f"  Mask progress: {completed_masks}/{total_masks} "
+                            f"({(completed_masks / total_masks) * 100:.1f}%)"
+                        )
+                        if use_inline_progress:
+                            print(progress_msg, end="\r", flush=True)
+                        else:
+                            print(progress_msg)
+                        while next_report <= completed_masks:
+                            next_report += report_interval
+
+                if verbose and use_inline_progress:
+                    print()
+
+        else:
+            if verbose:
+                print(f"Generating {len(equirect_images_to_process)} masks with YOLO (parallel)...")
+
+            mask_generation_tasks = []
+            for src_image_path, base_name in equirect_images_to_process:
+                tmp_mask_name = f"{base_name}_mask.png"
+                tmp_mask_path = str(tmp_masks_dir / tmp_mask_name)
+                mask_generation_tasks.append((
+                    src_image_path, tmp_mask_path, yolo_conf, invert_mask, yolo_classes,
+                    mask_overexposure, overexposure_threshold, overexposure_dilate,
+                ))
+
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                initializer=_init_yolo_worker,
+                initargs=(yolo_model_path,),
+            ) as executor:
+                futures_to_src = {}
+                for task in mask_generation_tasks:
+                    future = executor.submit(
+                        generate_mask_and_save,
+                        task[0], task[1], task[2], task[3], task[4], task[5], task[6], task[7],
+                    )
+                    futures_to_src[future] = task[0]
+
+                total_masks = len(futures_to_src)
+                completed_masks = 0
+                report_interval = max(1, total_masks // 20)
+                next_report = report_interval
+                use_inline_progress = sys.stdout.isatty()
+
+                if verbose and use_inline_progress:
+                    print(f"  Mask progress: 0/{total_masks} (0.0%)", end="\r", flush=True)
+
+                for future in as_completed(futures_to_src):
+                    completed_masks += 1
+                    try:
+                        image_path, mask_path = future.result()
+                        equirect_mask_paths[image_path] = mask_path
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  Error generating mask: {exc}")
+
+                    if verbose and (completed_masks >= next_report or completed_masks == total_masks):
+                        progress_msg = (
+                            f"  Mask progress: {completed_masks}/{total_masks} "
+                            f"({(completed_masks / total_masks) * 100:.1f}%)"
+                        )
+                        if use_inline_progress:
+                            print(progress_msg, end="\r", flush=True)
+                        else:
+                            print(progress_msg)
+                        while next_report <= completed_masks:
+                            next_report += report_interval
+
+                if verbose and use_inline_progress:
+                    print()
+
         if verbose:
             print(f"  Completed {len(equirect_mask_paths)} masks")
 
@@ -1214,7 +1430,8 @@ def main() -> int:
         "--generate-masks",
         action="store_true",
         default=config.get("generate-masks", False) if isinstance(config.get("generate-masks"), bool) else False,
-        help="Generate person masks using YOLO and crop them alongside images"
+        help="Generate segmentation masks and crop them alongside images. "
+             "Use --mask-engine to choose between 'yolo' (default) and 'sam3'."
     )
     parser.add_argument(
         "--yolo-model",
@@ -1288,9 +1505,57 @@ def main() -> int:
         default=int(config["overexposure-dilate"]) if "overexposure-dilate" in config else 5,
         help="Dilation radius in pixels for the overexposure mask to cover fringe artifacts (default: 5)"
     )
+    parser.add_argument(
+        "--mask-engine",
+        type=str,
+        choices=["yolo", "sam3"],
+        default=config.get("mask-engine", "yolo"),
+        help="Segmentation engine for mask generation: 'yolo' (class-based, fast, parallel) or 'sam3' "
+             "(open-vocabulary text prompts, requires 8GB+ VRAM, single worker). Default: yolo"
+    )
+    parser.add_argument(
+        "--sam3-model",
+        type=str,
+        default=config.get("sam3-model", "sam3.pt"),
+        help="Path to sam3.pt model file (must be downloaded manually from HuggingFace). Default: sam3.pt"
+    )
+    parser.add_argument(
+        "--sam3-concepts",
+        type=str,
+        default=config.get("sam3-concepts", "person,people,tourist,selfie stick,moving car,motorbike,bicycle"),
+        help="Comma-separated list of text concepts for SAM3 to segment. "
+             "Default: 'person,people,tourist,selfie stick,moving car,motorbike,bicycle'"
+    )
+    parser.add_argument(
+        "--sam3-conf",
+        type=float,
+        default=float(config["sam3-conf"]) if "sam3-conf" in config else 0.25,
+        help="Minimum SAM3 confidence score (0.0-1.0) to keep detections (default: 0.25)"
+    )
+    parser.add_argument(
+        "--sam3-half",
+        action="store_true",
+        default=config.get("sam3-half", True) if isinstance(config.get("sam3-half"), bool) else True,
+        help="Run SAM3 in FP16 mode to reduce VRAM from ~3.4 GB to ~1.7 GB (default: on)"
+    )
+    parser.add_argument(
+        "--no-sam3-half",
+        action="store_false",
+        dest="sam3_half",
+        help="Disable FP16 for SAM3 (use full FP32)"
+    )
 
     args = parser.parse_args()
-    
+
+    # Parse sam3-concepts if specified
+    sam3_concepts = None
+    if args.sam3_concepts:
+        sam3_concepts = [c.strip() for c in args.sam3_concepts.split(",") if c.strip()]
+
+    if not (0.0 <= args.sam3_conf <= 1.0):
+        print("Error: --sam3-conf must be in range [0.0, 1.0].")
+        return 1
+
     # Parse yolo-classes if specified
     yolo_classes = None
     if args.yolo_classes:
@@ -1361,6 +1626,7 @@ def main() -> int:
             verbose=not args.quiet,
             skip_directions=skip_directions_list,
             generate_masks=args.generate_masks,
+            mask_engine=args.mask_engine,
             yolo_model_path=args.yolo_model,
             yolo_conf=args.yolo_conf,
             invert_mask=args.invert_mask,
@@ -1371,6 +1637,10 @@ def main() -> int:
             mask_overexposure=args.mask_overexposure,
             overexposure_threshold=args.overexposure_threshold,
             overexposure_dilate=args.overexposure_dilate,
+            sam3_model_path=args.sam3_model,
+            sam3_concepts=sam3_concepts,
+            sam3_conf=args.sam3_conf,
+            sam3_half=args.sam3_half,
         )
         if not args.quiet:
             print("\nConversion complete!")

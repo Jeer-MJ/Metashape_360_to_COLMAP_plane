@@ -8,8 +8,12 @@ transforms.json format, without requiring nerfstudio.
 Dependencies:
     pip install numpy open3d
 
+Optional (required only for --split-cubemap):
+    pip install pillow opencv-python
+
 Usage:
     python metashape_to_lichtfeld.py --images ./images/ --xml cameras.xml --ply sparse.ply --output ./output/
+    python metashape_to_lichtfeld.py --images ./images/ --xml cameras.xml --split-cubemap --crop-size 1920
 
 Based on nerfstudio's metashape_utils.py (Apache 2.0 License)
 """
@@ -19,7 +23,7 @@ import json
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import numpy as np
 
@@ -34,6 +38,204 @@ except ImportError:
         HAS_PLYFILE = True
     except ImportError:
         HAS_PLYFILE = False
+
+# Optional image-processing libs — only required when --split-cubemap or --generate-masks is used.
+try:
+    from PIL import Image as _PILImage
+    import cv2 as _cv2
+    HAS_IMAGE_LIBS = True
+except ImportError:
+    HAS_IMAGE_LIBS = False
+
+# Optional YOLO — only required when --generate-masks is used.
+try:
+    from ultralytics import YOLO as _YOLO
+    HAS_YOLO = True
+except ImportError:
+    HAS_YOLO = False
+
+# ---------------------------------------------------------------------------
+# Cubemap-split helpers (ported from metashape_360_to_colmap.py)
+# ---------------------------------------------------------------------------
+
+_ALL_DIRECTIONS = ["top", "front", "right", "back", "left", "bottom"]
+
+_DIRECTION_YAW_DEG: Dict[str, float] = {
+    "top": 0.0, "front": 0.0, "right": -90.0,
+    "back": 180.0, "left": 90.0, "bottom": 0.0,
+}
+_DIRECTION_PITCH_DEG: Dict[str, float] = {
+    "top": 90.0, "front": 0.0, "right": 0.0,
+    "back": 0.0, "left": 0.0, "bottom": -90.0,
+}
+
+# Per-process remap-map cache for cubemap splitting.
+_lfs_remap_cache: Dict[tuple, Tuple[Any, Any]] = {}
+
+
+def _lfs_get_face_rotation(direction: str) -> np.ndarray:
+    """3x3 rotation matrix that orients the camera toward the given cubemap face."""
+    yaw = np.radians(_DIRECTION_YAW_DEG[direction])
+    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+    R_yaw = np.array([
+        [cos_y, 0.0, sin_y],
+        [0.0,   1.0, 0.0  ],
+        [-sin_y, 0.0, cos_y],
+    ])
+    pitch = np.radians(_DIRECTION_PITCH_DEG[direction])
+    cos_p, sin_p = np.cos(pitch), np.sin(pitch)
+    R_pitch = np.array([
+        [1.0, 0.0,   0.0  ],
+        [0.0, cos_p, -sin_p],
+        [0.0, sin_p,  cos_p],
+    ])
+    return R_yaw @ R_pitch
+
+
+def _lfs_compute_remap_maps(
+    direction: str,
+    crop_size: int,
+    fov_deg: float,
+    equirect_w: int,
+    equirect_h: int,
+) -> Tuple[Any, Any]:
+    """Compute (map_x, map_y) sampling arrays for cv2.remap (equirect → perspective)."""
+    w_out = h_out = crop_size
+    fx = fy = (w_out / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+    cx = cy = (w_out - 1) / 2.0
+
+    u, v = np.meshgrid(
+        np.arange(w_out, dtype=np.float32),
+        np.arange(h_out, dtype=np.float32),
+    )
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    z = np.ones_like(x)
+    dirs = np.stack([x, y, z], axis=-1)
+    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
+
+    R = _lfs_get_face_rotation(direction).astype(np.float32)
+    dirs = dirs @ R.T
+
+    lon = np.arctan2(dirs[..., 0], dirs[..., 2])
+    lat = np.arctan2(
+        dirs[..., 1],
+        np.sqrt(dirs[..., 0] ** 2 + dirs[..., 2] ** 2),
+    )
+
+    # flip_vertical=True matches the equirectangular convention used by Metashape
+    map_x = (lon / (2 * np.pi) + 0.5) * float(equirect_w)
+    map_y = (0.5 + lat / np.pi) * float(equirect_h)
+    map_y = np.clip(map_y, 0.0, float(equirect_h - 1))
+
+    return map_x.astype(np.float32), map_y.astype(np.float32)
+
+
+def _lfs_crop_face(
+    equirect_image: Any,
+    direction: str,
+    crop_size: int,
+    fov_deg: float,
+) -> Any:
+    """Rectilinear crop from equirectangular using cv2.remap. Returns PIL Image."""
+    width, height = equirect_image.size
+    key = (direction, crop_size, fov_deg, width, height)
+    if key not in _lfs_remap_cache:
+        _lfs_remap_cache[key] = _lfs_compute_remap_maps(
+            direction, crop_size, fov_deg, width, height
+        )
+    map_x, map_y = _lfs_remap_cache[key]
+
+    equirect_np = np.array(equirect_image.convert("RGB"))
+    sampled = _cv2.remap(
+        equirect_np,
+        map_x,
+        map_y,
+        interpolation=_cv2.INTER_LINEAR,
+        borderMode=_cv2.BORDER_WRAP,
+    )
+    return _PILImage.fromarray(sampled, mode="RGB")
+
+
+# ---------------------------------------------------------------------------
+# Mask-generation helpers (ported from metashape_360_to_colmap.py)
+# ---------------------------------------------------------------------------
+
+def _lfs_create_overexposure_mask(
+    image: Any,
+    threshold: int = 250,
+    dilate_pixels: int = 5,
+) -> np.ndarray:
+    """Return uint8 (H, W) array where 255 marks overexposed pixels.
+
+    A pixel is overexposed when all three RGB channels are >= threshold.
+    The result is dilated by dilate_pixels to cover bloom halation.
+    """
+    img_np = np.array(image)
+    blown = np.all(img_np >= threshold, axis=-1).astype(np.uint8) * 255
+    if dilate_pixels > 0:
+        kernel_size = dilate_pixels * 2 + 1
+        kernel = _cv2.getStructuringElement(
+            _cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+        blown = _cv2.dilate(blown, kernel, iterations=1)
+    return blown
+
+
+def _lfs_generate_mask(
+    image: Any,
+    yolo_model: Optional[Any],
+    yolo_conf: float = 0.25,
+    invert_mask: bool = False,
+    class_ids: Optional[List[int]] = None,
+    mask_overexposure: bool = False,
+    overexposure_threshold: int = 250,
+    overexposure_dilate: int = 5,
+) -> Any:
+    """Generate a combined YOLO + overexposure binary mask for one PIL image.
+
+    Works identically for full equirectangular images and individual cubemap
+    face crops — callers are responsible for passing the correct image.
+
+    Returns:
+        PIL Image (mode "L") where, by default (invert_mask=False):
+            255 = background (keep for training)
+              0 = masked region (remove from training)
+        When invert_mask=True the polarity is flipped.
+    """
+    h, w = np.array(image).shape[:2]
+    combined = np.zeros((h, w), dtype=np.uint8)
+
+    # --- YOLO person/object segmentation ---
+    if yolo_model is not None:
+        target_classes = class_ids if class_ids else [0]
+        results = yolo_model(image, verbose=False, conf=yolo_conf)
+        for result in results:
+            if result.masks is not None:
+                for i, cls in enumerate(result.boxes.cls):
+                    if int(cls) in target_classes:
+                        mask_data = result.masks.data[i].cpu().numpy()
+                        mask_resized = _cv2.resize(
+                            mask_data, (w, h), interpolation=_cv2.INTER_LINEAR
+                        )
+                        combined = np.maximum(
+                            combined, (mask_resized * 255).astype(np.uint8)
+                        )
+
+    # --- Overexposure mask ---
+    if mask_overexposure:
+        overexp = _lfs_create_overexposure_mask(
+            image,
+            threshold=overexposure_threshold,
+            dilate_pixels=overexposure_dilate,
+        )
+        combined = np.maximum(combined, overexp)
+
+    # Invert polarity: default is background=white, masked=black
+    if not invert_mask:
+        combined = 255 - combined
+
+    return _PILImage.fromarray(combined, mode="L")
 
 
 def find_param(calib_xml: ET.Element, param_name: str) -> float:
@@ -281,7 +483,19 @@ def convert_metashape_to_lichtfeld(
     fix_upside_down: bool = True,
     max_images: Optional[int] = None,
     copy_images: bool = True,
-    verbose: bool = True
+    verbose: bool = True,
+    split_cubemap: bool = False,
+    crop_size: int = 1920,
+    fov_deg: float = 90.0,
+    skip_directions: Optional[List[str]] = None,
+    generate_masks: bool = False,
+    yolo_model_path: str = "yolo11m-seg.pt",
+    yolo_classes: Optional[List[int]] = None,
+    yolo_conf: float = 0.25,
+    invert_mask: bool = False,
+    mask_overexposure: bool = False,
+    overexposure_threshold: int = 250,
+    overexposure_dilate: int = 5,
 ) -> Dict[str, Any]:
     """
     Convert Metashape data to LichtFeld-compatible transforms.json format.
@@ -294,8 +508,31 @@ def convert_metashape_to_lichtfeld(
         fix_upside_down: If True, fix the upside-down scene orientation
         max_images: Maximum number of camera frames to process (None = all)
         copy_images: If True, copy source images to output_dir/images/ and use
-                     relative paths in transforms.json (recommended for portability)
+                     relative paths in transforms.json (recommended for portability).
+                     Ignored when split_cubemap=True (crops always written to output).
         verbose: Print progress messages
+        split_cubemap: If True, split each equirectangular image into perspective
+                       cubemap-face crops (same approach as COLMAP mode) and write
+                       transforms.json with PINHOLE camera model.  When False (default)
+                       the original equirectangular images are used as-is with
+                       EQUIRECTANGULAR camera model.
+        crop_size: Square pixel size for each cubemap face crop (only used when
+                   split_cubemap=True).
+        fov_deg: Horizontal field-of-view in degrees for each crop
+                 (only used when split_cubemap=True, default 90°).
+        skip_directions: List of face directions to omit when split_cubemap=True.
+                         Valid values: top, front, right, back, left, bottom.
+        generate_masks: If True, run YOLO segmentation on every output image and
+                        save binary masks to output_dir/masks/ (requires ultralytics).
+        yolo_model_path: Path to the YOLO segmentation model weights file.
+        yolo_classes: YOLO class IDs to mask (default: [0] = person).
+        yolo_conf: Minimum confidence threshold for YOLO detections (0–1).
+        invert_mask: If True, flip mask polarity (masked region = white).
+        mask_overexposure: If True, also mask blown-out (overexposed) pixels.
+        overexposure_threshold: Per-channel brightness threshold for overexposure
+                                detection (0–255, default 250).
+        overexposure_dilate: Dilation radius in pixels applied to the overexposure
+                             mask to cover bloom halation (default 5).
 
     Returns:
         Dictionary with conversion statistics
@@ -306,10 +543,40 @@ def convert_metashape_to_lichtfeld(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create images subdirectory when copy mode is active
+    # In split-cubemap mode the cropped images are always written to output/images/.
     images_output_dir = output_dir / "images"
-    if copy_images:
+    if split_cubemap or copy_images:
         images_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if split_cubemap and not HAS_IMAGE_LIBS:
+        raise ImportError(
+            "--split-cubemap requires Pillow and OpenCV. "
+            "Install with: pip install pillow opencv-python"
+        )
+
+    # Masking setup — resolved before the frame loop to fail early on missing deps.
+    do_masking = generate_masks or mask_overexposure
+    masks_output_dir = output_dir / "masks"
+    yolo_model_instance = None
+    yolo_class_ids = yolo_classes if yolo_classes else [0]
+
+    if do_masking:
+        if not HAS_IMAGE_LIBS:
+            raise ImportError(
+                "Mask generation requires Pillow and OpenCV. "
+                "Install with: pip install pillow opencv-python"
+            )
+        masks_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if generate_masks:
+        if not HAS_YOLO:
+            raise ImportError(
+                "--generate-masks requires ultralytics. "
+                "Install with: pip install ultralytics"
+            )
+        if verbose:
+            print(f"Loading YOLO model: {yolo_model_path}")
+        yolo_model_instance = _YOLO(yolo_model_path)
 
     if verbose:
         print(f"Parsing Metashape XML: {xml_path}")
@@ -322,7 +589,10 @@ def convert_metashape_to_lichtfeld(
     camera_model = xml_data["camera_model"]
     
     if verbose:
-        print(f"Camera model: {camera_model}")
+        if split_cubemap:
+            print("Mode: cubemap split (PINHOLE, 6 perspective crops per panorama)")
+        else:
+            print(f"Camera model: {camera_model}")
         print(f"Found {len(sensor_dict)} sensor(s)")
     
     # Build image filename map
@@ -341,6 +611,14 @@ def convert_metashape_to_lichtfeld(
     if verbose:
         print(f"Found {len(image_files)} images in {images_dir}")
     
+    # Resolve active face directions for cubemap split mode
+    active_directions = _ALL_DIRECTIONS
+    if skip_directions:
+        active_directions = [d for d in _ALL_DIRECTIONS if d not in skip_directions]
+    if verbose and split_cubemap and skip_directions:
+        print(f"  Skipping directions: {skip_directions}")
+        print(f"  Using directions: {active_directions}")
+
     # Process frames
     frames = []
     num_skipped = 0
@@ -388,46 +666,134 @@ def convert_metashape_to_lichtfeld(
         if component_id in component_dict:
             transform = component_dict[component_id] @ transform
         
-        # Convert to LichtFeld convention
-        transform = transform_camera_matrix(transform, fix_upside_down)
-        
-        # Resolve image file_path for transforms.json
         src_image = image_filename_map[camera_label]
-        if copy_images:
-            dest = images_output_dir / src_image.name
-            if not dest.exists():
-                shutil.copy2(src_image, dest)
-            file_path = f"images/{src_image.name}"
+        base_name = Path(camera_label).stem
+
+        if split_cubemap:
+            # --- Cubemap-split mode: generate one PINHOLE frame per face ---
+            equirect_img = _PILImage.open(str(src_image))
+            if equirect_img.mode != "RGB":
+                equirect_img = equirect_img.convert("RGB")
+
+            for direction in active_directions:
+                # Compose face direction rotation into the camera pose BEFORE
+                # applying the LFS coordinate-system conversion.
+                R_face = _lfs_get_face_rotation(direction)
+                face_transform = transform.copy()
+                face_transform[:3, :3] = transform[:3, :3] @ R_face
+                # Translation (camera position) is identical for all faces.
+
+                lfs_transform = transform_camera_matrix(face_transform, fix_upside_down)
+
+                # Crop and save the perspective face image
+                output_image_name = f"{base_name}_{direction}.jpg"
+                output_image_path = images_output_dir / output_image_name
+                if not output_image_path.exists():
+                    cropped = _lfs_crop_face(equirect_img, direction, crop_size, fov_deg)
+                    cropped.save(str(output_image_path), quality=100)
+                elif do_masking:
+                    # Need the crop for mask generation even when image already exists.
+                    cropped = _lfs_crop_face(equirect_img, direction, crop_size, fov_deg)
+
+                frame = {
+                    "file_path": f"images/{output_image_name}",
+                    "transform_matrix": lfs_transform.tolist(),
+                }
+
+                if do_masking:
+                    mask_name = f"{base_name}_{direction}.png"
+                    mask_path_file = masks_output_dir / mask_name
+                    if not mask_path_file.exists():
+                        mask_img = _lfs_generate_mask(
+                            cropped,
+                            yolo_model_instance,
+                            yolo_conf=yolo_conf,
+                            invert_mask=invert_mask,
+                            class_ids=yolo_class_ids,
+                            mask_overexposure=mask_overexposure,
+                            overexposure_threshold=overexposure_threshold,
+                            overexposure_dilate=overexposure_dilate,
+                        )
+                        mask_img.save(str(mask_path_file))
+                    frame["mask_path"] = f"masks/{mask_name}"
+
+                frames.append(frame)
         else:
-            try:
-                rel_path = src_image.resolve().relative_to(output_dir.resolve())
-                file_path = rel_path.as_posix()
-            except ValueError:
-                file_path = src_image.resolve().as_posix()
-        
-        # Build frame data
-        frame = {
-            "file_path": file_path,
-            "transform_matrix": transform.tolist()
-        }
-        frame.update(sensor_dict[sensor_id])
-        frames.append(frame)
+            # --- Original mode: equirectangular image passed directly ---
+            transform = transform_camera_matrix(transform, fix_upside_down)
+
+            if copy_images:
+                dest = images_output_dir / src_image.name
+                if not dest.exists():
+                    shutil.copy2(src_image, dest)
+                file_path = f"images/{src_image.name}"
+            else:
+                try:
+                    rel_path = src_image.resolve().relative_to(output_dir.resolve())
+                    file_path = rel_path.as_posix()
+                except ValueError:
+                    file_path = src_image.resolve().as_posix()
+
+            frame = {
+                "file_path": file_path,
+                "transform_matrix": transform.tolist(),
+            }
+            frame.update(sensor_dict[sensor_id])
+
+            if do_masking:
+                mask_name = f"{base_name}.png"
+                mask_path_file = masks_output_dir / mask_name
+                if not mask_path_file.exists():
+                    pil_img = _PILImage.open(str(src_image)).convert("RGB")
+                    mask_img = _lfs_generate_mask(
+                        pil_img,
+                        yolo_model_instance,
+                        yolo_conf=yolo_conf,
+                        invert_mask=invert_mask,
+                        class_ids=yolo_class_ids,
+                        mask_overexposure=mask_overexposure,
+                        overexposure_threshold=overexposure_threshold,
+                        overexposure_dilate=overexposure_dilate,
+                    )
+                    mask_img.save(str(mask_path_file))
+                frame["mask_path"] = f"masks/{mask_name}"
+
+            frames.append(frame)
+
         num_processed += 1
     
     if verbose:
-        print(f"Processed {len(frames)} camera frames")
-        if copy_images:
+        print(f"Processed {num_processed} source images → {len(frames)} frames")
+        if split_cubemap:
+            print(f"  Cubemap crops written to: {images_output_dir}")
+        elif copy_images:
             print(f"  Images copied to: {images_output_dir}")
+        if do_masking:
+            print(f"  Masks written to: {masks_output_dir}")
         if max_images is not None and num_processed >= max_images:
             print(f"  (Stopped after {max_images} images due to --max-images)")
         if num_skipped > 0:
             print(f"Skipped {num_skipped} cameras")
     
     # Build output data
-    data = {
-        "camera_model": camera_model,
-        "frames": frames
-    }
+    if split_cubemap:
+        # PINHOLE intrinsics shared by all face crops — stored at the top level
+        fx = fy = (crop_size / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+        data: Dict[str, Any] = {
+            "camera_model": "PINHOLE",
+            "fl_x": fx,
+            "fl_y": fy,
+            "cx": crop_size / 2.0,
+            "cy": crop_size / 2.0,
+            "w": crop_size,
+            "h": crop_size,
+            "frames": frames,
+        }
+    else:
+        data = {
+            "camera_model": camera_model,
+            "frames": frames,
+        }
     
     # Store applied transform for reference
     applied_transform = get_applied_transform(fix_upside_down)
@@ -500,10 +866,13 @@ def convert_metashape_to_lichtfeld(
     
     return {
         "num_frames": len(frames),
+        "num_source_images": num_processed,
         "num_skipped": num_skipped,
-        "camera_model": camera_model,
+        "camera_model": "PINHOLE" if split_cubemap else camera_model,
+        "split_cubemap": split_cubemap,
         "has_pointcloud": pointcloud_written,
-        "images_copied": copy_images,
+        "images_copied": split_cubemap or copy_images,
+        "has_masks": do_masking,
     }
 
 
@@ -513,9 +882,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python metashape_to_lichtfeld.py --images ./images/ --xml cameras.xml
-    python metashape_to_lichtfeld.py --images ./images/ --xml cameras.xml --ply sparse.ply
-    python metashape_to_lichtfeld.py --images ./images/ --xml cameras.xml --ply sparse.ply --output ./other/
+    # Equirectangular mode (default)
+    python metashape_360_lfs.py --images ./images/ --xml cameras.xml
+    python metashape_360_lfs.py --images ./images/ --xml cameras.xml --ply sparse.ply
+
+    # Cubemap-split mode (PINHOLE, same approach as COLMAP)
+    python metashape_360_lfs.py --images ./images/ --xml cameras.xml --split-cubemap
+    python metashape_360_lfs.py --images ./images/ --xml cameras.xml --split-cubemap --crop-size 1920 --fov-deg 90
+    python metashape_360_lfs.py --images ./images/ --xml cameras.xml --split-cubemap --skip-directions bottom,top
         """
     )
     
@@ -535,9 +909,57 @@ Examples:
                         help="Suppress progress output")
     parser.add_argument("--no-copy-images", action="store_true",
                         help="Do not copy source images to output/images/; use original paths in transforms.json")
-    
+    # --- Cubemap-split options ---
+    parser.add_argument("--split-cubemap", action="store_true",
+                        help="Split each equirectangular image into 6 perspective cubemap-face crops "
+                             "and write transforms.json with PINHOLE camera model (same as COLMAP mode)")
+    parser.add_argument("--crop-size", type=int, default=1920,
+                        help="Square pixel size for each cubemap face crop (only used with --split-cubemap, default: 1920)")
+    parser.add_argument("--fov-deg", type=float, default=90.0,
+                        help="Horizontal field-of-view in degrees for each crop (only used with --split-cubemap, default: 90.0)")
+    parser.add_argument("--skip-directions", type=str, default="",
+                        help="Comma-separated list of face directions to skip with --split-cubemap. "
+                             "Valid: top,front,right,back,left,bottom  (e.g. 'bottom,top')")
+    # --- Mask-generation options ---
+    parser.add_argument("--generate-masks", action="store_true",
+                        help="Run YOLO segmentation on every output image and save binary masks "
+                             "to output/masks/. Requires: pip install ultralytics")
+    parser.add_argument("--yolo-model", type=str, default="yolo11m-seg.pt",
+                        help="Path to YOLO segmentation model weights (default: yolo11m-seg.pt)")
+    parser.add_argument("--yolo-classes", type=str, default="0",
+                        help="Comma-separated YOLO class IDs to mask (default: '0' = person)")
+    parser.add_argument("--yolo-conf", type=float, default=0.25,
+                        help="Minimum YOLO detection confidence threshold 0–1 (default: 0.25)")
+    parser.add_argument("--invert-mask", action="store_true",
+                        help="Invert mask polarity: masked region = white instead of black")
+    parser.add_argument("--mask-overexposure", action="store_true",
+                        help="Also mask blown-out (overexposed) pixels in every image")
+    parser.add_argument("--overexposure-threshold", type=int, default=250,
+                        help="Per-channel brightness to classify a pixel as overexposed (default: 250)")
+    parser.add_argument("--overexposure-dilate", type=int, default=5,
+                        help="Dilation radius in pixels for the overexposure mask (default: 5)")
+
     args = parser.parse_args()
-    
+
+    # Validate skip-directions
+    valid_directions = set(_ALL_DIRECTIONS)
+    skip_directions_list: Optional[List[str]] = None
+    if args.skip_directions:
+        skip_directions_list = [d.strip().lower() for d in args.skip_directions.split(",") if d.strip()]
+        invalid = set(skip_directions_list) - valid_directions
+        if invalid:
+            print(f"Error: Invalid directions: {invalid}. Valid: {valid_directions}")
+            return 1
+
+    # Parse YOLO class IDs (comma-separated ints)
+    yolo_classes_list: Optional[List[int]] = None
+    if args.yolo_classes:
+        try:
+            yolo_classes_list = [int(c.strip()) for c in args.yolo_classes.split(",") if c.strip()]
+        except ValueError:
+            print(f"Error: --yolo-classes must be comma-separated integers, got: {args.yolo_classes}")
+            return 1
+
     if not args.images.is_dir():
         print(f"Error: Images directory not found: {args.images}")
         return 1
@@ -559,16 +981,32 @@ Examples:
             fix_upside_down=not args.no_fix_rotation,
             max_images=args.max_images,
             copy_images=not args.no_copy_images,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            split_cubemap=args.split_cubemap,
+            crop_size=args.crop_size,
+            fov_deg=args.fov_deg,
+            skip_directions=skip_directions_list,
+            generate_masks=args.generate_masks,
+            yolo_model_path=args.yolo_model,
+            yolo_classes=yolo_classes_list,
+            yolo_conf=args.yolo_conf,
+            invert_mask=args.invert_mask,
+            mask_overexposure=args.mask_overexposure,
+            overexposure_threshold=args.overexposure_threshold,
+            overexposure_dilate=args.overexposure_dilate,
         )
         
         if not args.quiet:
             print("\nConversion complete!")
             print(f"  Frames: {result['num_frames']}")
+            print(f"  Source images: {result['num_source_images']}")
             print(f"  Skipped: {result['num_skipped']}")
             print(f"  Camera model: {result['camera_model']}")
+            if result['split_cubemap']:
+                print(f"  Mode: cubemap split (PINHOLE crops)")
             print(f"  Point cloud: {'Yes' if result['has_pointcloud'] else 'No'}")
-            print(f"  Images copied: {'Yes' if result['images_copied'] else 'No (original paths used)'}")
+            print(f"  Images in output: {'Yes' if result['images_copied'] else 'No (original paths used)'}")
+            print(f"  Masks: {'Yes' if result['has_masks'] else 'No'}")
         
         return 0
     

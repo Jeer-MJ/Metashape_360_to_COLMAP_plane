@@ -30,6 +30,7 @@ DEFAULTS = {
     "range_end": 10000,
     "num_workers": min(multiprocessing.cpu_count(), 8),
     "generate_masks": True,
+    "mask_engine": "yolo",
     "invert_mask": False,
     "yaw_offset": 0.0,
     "quiet": False,
@@ -39,11 +40,17 @@ DEFAULTS = {
     "overexposure_threshold": 250,
     "overexposure_dilate": 5,
     "yolo_model": "yolo11m-seg.pt",
+    "sam3_model": "sam3.pt",
+    "sam3_concepts": "person,people,tourist,selfie stick,moving car,motorbike,bicycle",
+    "sam3_conf": 0.25,
+    "sam3_half": True,
     "apply_component_transform": False,
     "flip_vertical": True,
     "rotate_z180": True,
     "fix_upside_down": True,
     "lfs_copy_images": True,
+    "lfs_split_cubemap": False,
+    "enable_cubemap": True,
     "language": "EN",
 }
 
@@ -78,11 +85,19 @@ UI_TEXT = {
         "skip_section": "Skip Directions",
         "skip_note": "(Skip cubemap generation for selected directions)",
         "mask_section": "Mask Generation",
-        "enable_yolo": "Enable YOLO mask generation",
+        "enable_yolo": "Enable mask generation",
+        "mask_engine_label": "Engine:",
+        "mask_engine_yolo": "YOLO (fast, class IDs)",
+        "mask_engine_sam3": "SAM3 (text prompts, 8GB+ VRAM)",
         "yolo_classes": "YOLO Class IDs:",
         "yolo_conf": "YOLO Confidence:",
         "yolo_model": "YOLO Model:",
         "invert_mask": "Invert mask (object=white)",
+        "sam3_model": "SAM3 Model:",
+        "sam3_concepts": "Concepts (comma-separated):",
+        "sam3_conf": "SAM3 Confidence:",
+        "sam3_half": "FP16 (reduces VRAM to ~1.7 GB)",
+        "sam3_vram_warn": "SAM3 requires 8 GB+ VRAM and runs sequentially (1 worker).",
         "enable_overexp": "Enable overexposure mask",
         "threshold": "Threshold (0-255):",
         "dilate": "Dilation Radius:",
@@ -142,6 +157,14 @@ UI_TEXT = {
         "lfs_copy_images": "Copy images to output folder",
         "tip_lfs_copy_images": "Copy source images into output/images/ and use relative paths in transforms.json (recommended for portability)",
         "tip_mode": "COLMAP mode: generates 6 cubemap crops + cameras.txt/images.txt.  LFS mode: generates transforms.json for Licht-Feld Studio directly.",
+        "lfs_split_cubemap": "Split into cubemap faces (PINHOLE crops)",
+        "tip_lfs_split_cubemap": "Split each equirectangular image into 6 perspective crops and use PINHOLE camera model in transforms.json — same approach as COLMAP mode",
+        "lfs_split_crop_fov": "Crop Size / FoV:",
+        "cubemap_section": "Cubemap Options",
+        "enable_cubemap": "Enable Cubemap Split",
+        "tip_enable_cubemap": "Split equirectangular images into 6 perspective (PINHOLE) crops. Always active in COLMAP mode; optional in LFS mode.",
+        "lfs_mask_note": "Mask generation is not supported in LFS mode.",
+        "skip_inline": "Skip directions:",
     },
     "JP": {
         "app_title": "Metashape 360° to COLMAP コンバーター",
@@ -164,11 +187,19 @@ UI_TEXT = {
         "skip_section": "スキップ方向",
         "skip_note": "(選択した方向のCubemap生成をスキップします)",
         "mask_section": "マスク生成",
-        "enable_yolo": "YOLOマスク生成を有効化",
+        "enable_yolo": "マスク生成を有効化",
+        "mask_engine_label": "エンジン:",
+        "mask_engine_yolo": "YOLO (高速, クラスID)",
+        "mask_engine_sam3": "SAM3 (テキストプロンプト, 8GB+ VRAM)",
         "yolo_classes": "YOLOクラスID:",
         "yolo_conf": "YOLO信頼度閾値:",
         "yolo_model": "YOLOモデル:",
         "invert_mask": "マスク反転 (物体=白)",
+        "sam3_model": "SAM3モデル:",
+        "sam3_concepts": "概念 (カンマ区切り):",
+        "sam3_conf": "SAM3信頼度閾値:",
+        "sam3_half": "FP16 (VRAM約1.7GBに削減)",
+        "sam3_vram_warn": "SAM3は8GB以上のVRAMが必要で順次処理 (ワーカー1)。",
         "enable_overexp": "露出オーバーマスクを有効化",
         "threshold": "閾値 (0-255):",
         "dilate": "膨張半径:",
@@ -228,6 +259,14 @@ UI_TEXT = {
         "lfs_copy_images": "画像を出力フォルダにコピー",
         "tip_lfs_copy_images": "ソース画像をoutput/images/にコピーしてtransforms.jsonで相対パスを使用 (可搬性のため推奨)",
         "tip_mode": "COLMAPモード: 6面Cubemapクロップ＋cameras.txt/images.txtを生成。LFSモード: Licht-Feld Studio用transforms.jsonを直接生成。",
+        "lfs_split_cubemap": "Cubemap面分割 (PINHOLEクロップ)",
+        "tip_lfs_split_cubemap": "各Equirectangular画像を6面の透視投影クロップに分割し、transforms.jsonでPINHOLEカメラモデルを使用 — COLMAPモードと同じアプローチ",
+        "lfs_split_crop_fov": "クロップサイズ / FoV:",
+        "cubemap_section": "Cubemapオプション",
+        "enable_cubemap": "Cubemap分割を有効化",
+        "tip_enable_cubemap": "Equirectangular画像を6面のPINHOLEクロップに分割します。COLMAPモードでは常に有効；LFSモードでは任意。",
+        "lfs_mask_note": "マスク生成はLFSモードでは使用できません。",
+        "skip_inline": "スキップ方向:",
     },
 }
 
@@ -315,10 +354,15 @@ class Metashape360GUI:
         
         # Mask options
         self.var_generate_masks = tk.BooleanVar(value=DEFAULTS["generate_masks"])
+        self.var_mask_engine = tk.StringVar(value=DEFAULTS["mask_engine"])
         self.var_invert_mask = tk.BooleanVar(value=DEFAULTS["invert_mask"])
         self.var_yolo_classes = tk.StringVar(value=DEFAULTS["yolo_classes"])
         self.var_yolo_conf = tk.DoubleVar(value=DEFAULTS["yolo_conf"])
         self.var_yolo_model = tk.StringVar(value=DEFAULTS["yolo_model"])
+        self.var_sam3_model = tk.StringVar(value=DEFAULTS["sam3_model"])
+        self.var_sam3_concepts = tk.StringVar(value=DEFAULTS["sam3_concepts"])
+        self.var_sam3_conf = tk.DoubleVar(value=DEFAULTS["sam3_conf"])
+        self.var_sam3_half = tk.BooleanVar(value=DEFAULTS["sam3_half"])
         
         # Overexposure mask
         self.var_mask_overexposure = tk.BooleanVar(value=DEFAULTS["mask_overexposure"])
@@ -330,11 +374,13 @@ class Metashape360GUI:
         self.var_rotate_z180 = tk.BooleanVar(value=DEFAULTS["rotate_z180"])
         self.var_fix_upside_down = tk.BooleanVar(value=DEFAULTS["fix_upside_down"])
         self.var_lfs_copy_images = tk.BooleanVar(value=DEFAULTS["lfs_copy_images"])
+        self.var_lfs_split_cubemap = tk.BooleanVar(value=DEFAULTS["lfs_split_cubemap"])
         self.var_apply_component = tk.BooleanVar(value=DEFAULTS["apply_component_transform"])
         self.var_quiet = tk.BooleanVar(value=DEFAULTS["quiet"])
         self.var_language = tk.StringVar(value=DEFAULTS["language"])
         self.var_advanced_expanded = tk.BooleanVar(value=False)
         self.var_output_mode = tk.StringVar(value=DEFAULTS["output_mode"])
+        self.var_enable_cubemap = tk.BooleanVar(value=DEFAULTS["enable_cubemap"])
 
     def t(self, key, **kwargs):
         """Get localized UI text."""
@@ -451,55 +497,42 @@ class Metashape360GUI:
                            is_folder=True, row=3,
                            tooltip=self.t("tip_output"))
         
-        # ===== Tabbed Options Section (COLMAP-only) =====
+        # ===== Tabbed Options Section (visible in BOTH modes) =====
         self.options_notebook = ttk.Notebook(scrollable_frame)
         self.options_notebook.pack(fill="x", padx=padx, pady=pady)
 
         proc_tab = ttk.Frame(self.options_notebook, padding=10)
-        skip_tab = ttk.Frame(self.options_notebook, padding=10)
+        cubemap_tab = ttk.Frame(self.options_notebook, padding=10)
         mask_tab = ttk.Frame(self.options_notebook, padding=10)
         self.options_notebook.add(proc_tab, text=self.t("proc_section"))
-        self.options_notebook.add(skip_tab, text=self.t("skip_section"))
+        self.options_notebook.add(cubemap_tab, text=self.t("cubemap_section"))
         self.options_notebook.add(mask_tab, text=self.t("mask_section"))
 
-        # Processing tab
-        ttk.Label(proc_tab, text=self.t("crop_size")).grid(row=0, column=0, sticky="w", padx=5)
-        crop_spin = ttk.Spinbox(proc_tab, from_=256, to=4096, increment=64,
-                                textvariable=self.var_crop_size, width=10)
-        crop_spin.grid(row=0, column=1, sticky="w", padx=5, pady=3)
-        ToolTip(crop_spin, self.t("tip_crop_size"))
-
-        ttk.Label(proc_tab, text=self.t("fov")).grid(row=0, column=2, sticky="w", padx=5)
-        fov_spin = ttk.Spinbox(proc_tab, from_=60, to=120, increment=5,
-                               textvariable=self.var_fov_deg, width=10)
-        fov_spin.grid(row=0, column=3, sticky="w", padx=5, pady=3)
-        ToolTip(fov_spin, self.t("tip_fov"))
-
-        ttk.Label(proc_tab, text=self.t("max_images")).grid(row=1, column=0, sticky="w", padx=5)
+        # --- Processing tab (shared, some widgets COLMAP-only) ---
+        ttk.Label(proc_tab, text=self.t("max_images")).grid(row=0, column=0, sticky="w", padx=5)
         max_spin = ttk.Spinbox(proc_tab, from_=1, to=100000, increment=100,
                                textvariable=self.var_max_images, width=10)
-        max_spin.grid(row=1, column=1, sticky="w", padx=5, pady=3)
+        max_spin.grid(row=0, column=1, sticky="w", padx=5, pady=3)
         ToolTip(max_spin, self.t("tip_max_images"))
 
-        ttk.Label(proc_tab, text=self.t("workers")).grid(row=1, column=2, sticky="w", padx=5)
-        worker_spin = ttk.Spinbox(proc_tab, from_=1, to=32, increment=1,
-                                  textvariable=self.var_num_workers, width=10)
-        worker_spin.grid(row=1, column=3, sticky="w", padx=5, pady=3)
-        ToolTip(worker_spin, self.t("tip_workers"))
+        ttk.Label(proc_tab, text=self.t("workers")).grid(row=0, column=2, sticky="w", padx=5)
+        self.worker_spin = ttk.Spinbox(proc_tab, from_=1, to=32, increment=1,
+                                       textvariable=self.var_num_workers, width=10)
+        self.worker_spin.grid(row=0, column=3, sticky="w", padx=5, pady=3)
+        ToolTip(self.worker_spin, self.t("tip_workers"))
 
-        range_check = ttk.Checkbutton(proc_tab, text=self.t("range"),
-                                      variable=self.var_range_enabled,
-                                      command=self.toggle_range)
-        range_check.grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self.range_check = ttk.Checkbutton(proc_tab, text=self.t("range"),
+                                           variable=self.var_range_enabled,
+                                           command=self.toggle_range)
+        self.range_check.grid(row=1, column=0, sticky="w", padx=5, pady=3)
 
         self.range_frame = ttk.Frame(proc_tab)
-        self.range_frame.grid(row=2, column=1, columnspan=3, sticky="w", padx=5)
+        self.range_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=5)
 
         ttk.Label(self.range_frame, text=self.t("range_start")).pack(side="left")
         self.range_start_spin = ttk.Spinbox(self.range_frame, from_=0, to=100000,
                                             textvariable=self.var_range_start, width=8)
         self.range_start_spin.pack(side="left", padx=2)
-
         ttk.Label(self.range_frame, text=self.t("range_end")).pack(side="left", padx=(10, 0))
         self.range_end_spin = ttk.Spinbox(self.range_frame, from_=1, to=100000,
                                           textvariable=self.var_range_end, width=8)
@@ -507,31 +540,87 @@ class Metashape360GUI:
         ToolTip(self.range_frame, self.t("tip_range"))
         self.toggle_range()
 
-        ttk.Label(proc_tab, text=self.t("yaw_offset")).grid(row=3, column=0, sticky="w", padx=5)
-        yaw_spin = ttk.Spinbox(proc_tab, from_=-180, to=180, increment=5,
-                               textvariable=self.var_yaw_offset, width=10)
-        yaw_spin.grid(row=3, column=1, sticky="w", padx=5, pady=3)
-        ToolTip(yaw_spin, self.t("tip_yaw_offset"))
+        ttk.Label(proc_tab, text=self.t("yaw_offset")).grid(row=2, column=0, sticky="w", padx=5)
+        self.yaw_spin = ttk.Spinbox(proc_tab, from_=-180, to=180, increment=5,
+                                    textvariable=self.var_yaw_offset, width=10)
+        self.yaw_spin.grid(row=2, column=1, sticky="w", padx=5, pady=3)
+        ToolTip(self.yaw_spin, self.t("tip_yaw_offset"))
 
-        # Skip directions tab
-        directions_inner = ttk.Frame(skip_tab)
-        directions_inner.pack(fill="x")
+        # --- Cubemap tab ---
+        # In COLMAP mode the checkbox is locked ON; in LFS mode the user can toggle it.
+        self.cubemap_enable_cb = ttk.Checkbutton(
+            cubemap_tab,
+            text=self.t("enable_cubemap"),
+            variable=self.var_enable_cubemap,
+            command=self.toggle_cubemap_options,
+        )
+        self.cubemap_enable_cb.grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 6))
+        ToolTip(self.cubemap_enable_cb, self.t("tip_enable_cubemap"))
 
+        self.cubemap_inner_frame = ttk.Frame(cubemap_tab)
+        self.cubemap_inner_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
+
+        ttk.Label(self.cubemap_inner_frame, text=self.t("crop_size")).grid(
+            row=0, column=0, sticky="w", padx=5)
+        self.crop_spin = ttk.Spinbox(self.cubemap_inner_frame, from_=256, to=4096, increment=64,
+                                     textvariable=self.var_crop_size, width=10)
+        self.crop_spin.grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ToolTip(self.crop_spin, self.t("tip_crop_size"))
+
+        ttk.Label(self.cubemap_inner_frame, text=self.t("fov")).grid(
+            row=0, column=2, sticky="w", padx=5)
+        self.fov_spin = ttk.Spinbox(self.cubemap_inner_frame, from_=60, to=120, increment=5,
+                                    textvariable=self.var_fov_deg, width=10)
+        self.fov_spin.grid(row=0, column=3, sticky="w", padx=5, pady=3)
+        ToolTip(self.fov_spin, self.t("tip_fov"))
+
+        ttk.Label(self.cubemap_inner_frame, text=self.t("skip_inline")).grid(
+            row=1, column=0, sticky="w", padx=5, pady=(8, 0))
+        self.skip_dir_checkbuttons = {}
         for i, direction in enumerate(VALID_DIRECTIONS):
-            cb = ttk.Checkbutton(directions_inner, text=direction.capitalize(),
+            cb = ttk.Checkbutton(self.cubemap_inner_frame, text=direction.capitalize(),
                                  variable=self.var_skip_directions[direction])
-            cb.grid(row=0, column=i, padx=10, pady=3)
+            cb.grid(row=1, column=i + 1, padx=6, pady=(8, 0))
+            self.skip_dir_checkbuttons[direction] = cb
 
-        ttk.Label(skip_tab, text=self.t("skip_note"),
-                  foreground="gray").pack(anchor="w", pady=(5, 0))
+        ttk.Label(self.cubemap_inner_frame, text=self.t("skip_note"),
+                  foreground="gray").grid(row=2, column=0, columnspan=7, sticky="w",
+                                         padx=5, pady=(2, 0))
 
-        # Mask generation tab
-        ttk.Checkbutton(mask_tab, text=self.t("enable_yolo"),
-                        variable=self.var_generate_masks,
-                        command=self.toggle_mask_options).grid(row=0, column=0, columnspan=2, sticky="w")
+        # --- Mask generation tab (COLMAP-only; informational note shown in LFS) ---
+        self.lbl_mask_lfs_note = ttk.Label(
+            mask_tab, text=self.t("lfs_mask_note"), foreground="gray"
+        )
 
-        self.yolo_frame = ttk.Frame(mask_tab)
-        self.yolo_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=5)
+        self.yolo_enable_cb = ttk.Checkbutton(mask_tab, text=self.t("enable_yolo"),
+                                              variable=self.var_generate_masks,
+                                              command=self.toggle_mask_options)
+        self.yolo_enable_cb.grid(row=1, column=0, columnspan=2, sticky="w")
+
+        # Engine selector row
+        engine_frame = ttk.Frame(mask_tab)
+        engine_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 2))
+        ttk.Label(engine_frame, text=self.t("mask_engine_label")).pack(side="left", padx=5)
+        self.rb_engine_yolo = ttk.Radiobutton(
+            engine_frame,
+            text=self.t("mask_engine_yolo"),
+            variable=self.var_mask_engine,
+            value="yolo",
+            command=self.toggle_mask_engine,
+        )
+        self.rb_engine_yolo.pack(side="left", padx=5)
+        self.rb_engine_sam3 = ttk.Radiobutton(
+            engine_frame,
+            text=self.t("mask_engine_sam3"),
+            variable=self.var_mask_engine,
+            value="sam3",
+            command=self.toggle_mask_engine,
+        )
+        self.rb_engine_sam3.pack(side="left", padx=5)
+
+        # YOLO options frame
+        self.yolo_frame = ttk.LabelFrame(mask_tab, text="YOLO", padding=6)
+        self.yolo_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=4)
 
         ttk.Label(self.yolo_frame, text=self.t("yolo_classes")).grid(row=0, column=0, sticky="w", padx=5)
         yolo_entry = ttk.Entry(self.yolo_frame, textvariable=self.var_yolo_classes, width=20)
@@ -540,7 +629,7 @@ class Metashape360GUI:
 
         ttk.Label(self.yolo_frame, text=self.t("yolo_conf")).grid(row=0, column=2, sticky="w", padx=5)
         conf_spin = ttk.Spinbox(self.yolo_frame, from_=0.0, to=1.0, increment=0.05,
-                    textvariable=self.var_yolo_conf, width=8)
+                                textvariable=self.var_yolo_conf, width=8)
         conf_spin.grid(row=0, column=3, sticky="w", padx=5)
         ToolTip(conf_spin, self.t("tip_yolo_conf"))
 
@@ -555,16 +644,51 @@ class Metashape360GUI:
         model_combo.grid(row=1, column=1, columnspan=3, sticky="w", padx=5)
 
         ttk.Checkbutton(self.yolo_frame, text=self.t("invert_mask"),
-                variable=self.var_invert_mask).grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=3)
+                        variable=self.var_invert_mask).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=5, pady=3)
 
-        ttk.Separator(mask_tab, orient="horizontal").grid(row=2, column=0, columnspan=4, sticky="ew", pady=10)
+        # SAM3 options frame
+        self.sam3_frame = ttk.LabelFrame(mask_tab, text="SAM3", padding=6)
+        self.sam3_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=4)
 
-        ttk.Checkbutton(mask_tab, text=self.t("enable_overexp"),
-                        variable=self.var_mask_overexposure,
-                        command=self.toggle_overexposure_options).grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.sam3_frame, text=self.t("sam3_model")).grid(row=0, column=0, sticky="w", padx=5)
+        sam3_model_entry = ttk.Entry(self.sam3_frame, textvariable=self.var_sam3_model, width=24)
+        sam3_model_entry.grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Button(
+            self.sam3_frame, text=self.t("browse"), width=8,
+            command=lambda: self.browse_file(self.var_sam3_model, [("PT files", "*.pt"), ("All files", "*.*")])
+        ).grid(row=0, column=2, padx=5)
+
+        ttk.Label(self.sam3_frame, text=self.t("sam3_concepts")).grid(row=1, column=0, sticky="w", padx=5)
+        sam3_concepts_entry = ttk.Entry(self.sam3_frame, textvariable=self.var_sam3_concepts, width=48)
+        sam3_concepts_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(self.sam3_frame, text=self.t("sam3_conf")).grid(row=2, column=0, sticky="w", padx=5)
+        sam3_conf_spin = ttk.Spinbox(self.sam3_frame, from_=0.0, to=1.0, increment=0.05,
+                                     textvariable=self.var_sam3_conf, width=8)
+        sam3_conf_spin.grid(row=2, column=1, sticky="w", padx=5)
+
+        ttk.Checkbutton(self.sam3_frame, text=self.t("sam3_half"),
+                        variable=self.var_sam3_half).grid(
+            row=2, column=2, sticky="w", padx=5)
+
+        ttk.Label(
+            self.sam3_frame, text=self.t("sam3_vram_warn"), foreground="orange"
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 0))
+
+        ttk.Checkbutton(self.sam3_frame, text=self.t("invert_mask"),
+                        variable=self.var_invert_mask).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=5, pady=3)
+
+        ttk.Separator(mask_tab, orient="horizontal").grid(row=5, column=0, columnspan=4, sticky="ew", pady=10)
+
+        self.overexp_enable_cb = ttk.Checkbutton(mask_tab, text=self.t("enable_overexp"),
+                                                 variable=self.var_mask_overexposure,
+                                                 command=self.toggle_overexposure_options)
+        self.overexp_enable_cb.grid(row=6, column=0, columnspan=2, sticky="w")
 
         self.overexposure_frame = ttk.Frame(mask_tab)
-        self.overexposure_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=5)
+        self.overexposure_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=5)
 
         ttk.Label(self.overexposure_frame, text=self.t("threshold")).grid(row=0, column=0, sticky="w", padx=5)
         thresh_spin = ttk.Spinbox(self.overexposure_frame, from_=200, to=255, increment=1,
@@ -579,6 +703,7 @@ class Metashape360GUI:
         ToolTip(dilate_spin, self.t("tip_overexp_dilate"))
 
         self.toggle_mask_options()
+        self.toggle_mask_engine()
         self.toggle_overexposure_options()
         tab_count = self.options_notebook.index("end")
         if tab_count > 0:
@@ -710,17 +835,39 @@ class Metashape360GUI:
             variable.set(path)
     
     def toggle_range(self):
-        """Toggle range input fields state."""
-        state = "normal" if self.var_range_enabled.get() else "disabled"
+        """Toggle range input fields state; always disabled in LFS mode."""
+        is_colmap = self.var_output_mode.get() == "COLMAP"
+        enabled = is_colmap and self.var_range_enabled.get()
+        state = "normal" if enabled else "disabled"
         self.range_start_spin.config(state=state)
         self.range_end_spin.config(state=state)
     
     def toggle_mask_options(self):
-        """Toggle YOLO mask options state."""
-        state = "normal" if self.var_generate_masks.get() else "disabled"
+        """Toggle mask engine selector and engine-specific frames based on enable checkbox."""
+        enabled = self.var_generate_masks.get()
+        for widget in (self.rb_engine_yolo, self.rb_engine_sam3):
+            try:
+                widget.config(state="normal" if enabled else "disabled")
+            except tk.TclError:
+                pass
+        self.toggle_mask_engine()
+
+    def toggle_mask_engine(self):
+        """Show/hide YOLO or SAM3 frame depending on the selected engine."""
+        enabled = self.var_generate_masks.get()
+        engine = self.var_mask_engine.get()
+
+        yolo_state = "normal" if enabled and engine == "yolo" else "disabled"
         for child in self.yolo_frame.winfo_children():
             try:
-                child.config(state=state)
+                child.config(state=yolo_state)
+            except tk.TclError:
+                pass
+
+        sam3_state = "normal" if enabled and engine == "sam3" else "disabled"
+        for child in self.sam3_frame.winfo_children():
+            try:
+                child.config(state=sam3_state)
             except tk.TclError:
                 pass
     
@@ -748,25 +895,54 @@ class Metashape360GUI:
         self.var_advanced_expanded.set(not self.var_advanced_expanded.get())
         self.update_advanced_section_visibility()
 
+    def toggle_cubemap_options(self):
+        """Enable/disable cubemap inner controls based on the enable_cubemap toggle."""
+        enabled = self.var_enable_cubemap.get()
+        state = "normal" if enabled else "disabled"
+        self.crop_spin.config(state=state)
+        self.fov_spin.config(state=state)
+        for cb in self.skip_dir_checkbuttons.values():
+            cb.config(state=state)
+
     def toggle_mode_ui(self):
-        """Show/hide COLMAP-specific vs LFS-specific UI widgets based on output mode."""
+        """Enable/disable widgets based on the selected output mode."""
         is_colmap = self.var_output_mode.get() == "COLMAP"
 
-        # Show or hide the full COLMAP options notebook (crop, skip, mask tabs)
-        if is_colmap:
-            self.options_notebook.pack(fill="x", padx=10, pady=5)
-        else:
-            self.options_notebook.pack_forget()
+        # Notebook is always visible; adjust per-widget state instead.
 
-        # Toggle COLMAP-only advanced checkboxes
+        # Cubemap tab: COLMAP always forces cubemap ON and locks the checkbox.
+        if is_colmap:
+            self.var_enable_cubemap.set(True)
+            self.cubemap_enable_cb.config(state="disabled")
+        else:
+            self.cubemap_enable_cb.config(state="normal")
+
+        # Processing tab: workers, range and yaw are COLMAP-only.
         colmap_only_state = "normal" if is_colmap else "disabled"
+        self.worker_spin.config(state=colmap_only_state)
+        self.range_check.config(state=colmap_only_state)
+        self.yaw_spin.config(state=colmap_only_state)
+        self.toggle_range()  # evaluates both mode and checkbox state
+
+        # Advanced: COLMAP-only options.
         self.rotate_z180_cb.config(state=colmap_only_state)
         self.apply_component_cb.config(state=colmap_only_state)
 
-        # Toggle LFS-only advanced checkboxes
+        # Advanced: LFS-only options.
         lfs_only_state = "normal" if not is_colmap else "disabled"
         self.fix_upside_down_cb.config(state=lfs_only_state)
         self.lfs_copy_images_cb.config(state=lfs_only_state)
+
+        # Mask tab: enabled in both COLMAP and LFS modes.
+        self.lbl_mask_lfs_note.grid_remove()
+        self.yolo_enable_cb.config(state="normal")
+        self.overexp_enable_cb.config(state="normal")
+        self.toggle_mask_options()
+        self.toggle_mask_engine()
+        self.toggle_overexposure_options()
+
+        # Sync cubemap inner controls.
+        self.toggle_cubemap_options()
     
     def reset_defaults(self):
         """Reset all settings to defaults."""
@@ -783,10 +959,15 @@ class Metashape360GUI:
         self.var_num_workers.set(DEFAULTS["num_workers"])
         self.var_yaw_offset.set(DEFAULTS["yaw_offset"])
         self.var_generate_masks.set(DEFAULTS["generate_masks"])
+        self.var_mask_engine.set(DEFAULTS["mask_engine"])
         self.var_invert_mask.set(DEFAULTS["invert_mask"])
         self.var_yolo_classes.set(DEFAULTS["yolo_classes"])
         self.var_yolo_conf.set(DEFAULTS["yolo_conf"])
         self.var_yolo_model.set(DEFAULTS["yolo_model"])
+        self.var_sam3_model.set(DEFAULTS["sam3_model"])
+        self.var_sam3_concepts.set(DEFAULTS["sam3_concepts"])
+        self.var_sam3_conf.set(DEFAULTS["sam3_conf"])
+        self.var_sam3_half.set(DEFAULTS["sam3_half"])
         self.var_mask_overexposure.set(DEFAULTS["mask_overexposure"])
         self.var_overexposure_threshold.set(DEFAULTS["overexposure_threshold"])
         self.var_overexposure_dilate.set(DEFAULTS["overexposure_dilate"])
@@ -794,16 +975,14 @@ class Metashape360GUI:
         self.var_rotate_z180.set(DEFAULTS["rotate_z180"])
         self.var_fix_upside_down.set(DEFAULTS["fix_upside_down"])
         self.var_lfs_copy_images.set(DEFAULTS["lfs_copy_images"])
+        self.var_enable_cubemap.set(DEFAULTS["enable_cubemap"])
         self.var_apply_component.set(DEFAULTS["apply_component_transform"])
         self.var_quiet.set(DEFAULTS["quiet"])
         self.var_output_mode.set(DEFAULTS["output_mode"])
-        
+
         for d in VALID_DIRECTIONS:
             self.var_skip_directions[d].set(False)
-        
-        self.toggle_range()
-        self.toggle_mask_options()
-        self.toggle_overexposure_options()
+
         self.toggle_mode_ui()
         
         self.log(f"{self.t('reset_done')}\n")
@@ -857,9 +1036,17 @@ class Metashape360GUI:
 
         if self.var_generate_masks.get():
             cmd.append("--generate-masks")
-            cmd.extend(["--yolo-classes", self.var_yolo_classes.get()])
-            cmd.extend(["--yolo-conf", str(self.var_yolo_conf.get())])
-            cmd.extend(["--yolo-model", self.var_yolo_model.get()])
+            cmd.extend(["--mask-engine", self.var_mask_engine.get()])
+            if self.var_mask_engine.get() == "sam3":
+                cmd.extend(["--sam3-model", self.var_sam3_model.get()])
+                cmd.extend(["--sam3-concepts", self.var_sam3_concepts.get()])
+                cmd.extend(["--sam3-conf", str(self.var_sam3_conf.get())])
+                if not self.var_sam3_half.get():
+                    cmd.append("--no-sam3-half")
+            else:
+                cmd.extend(["--yolo-classes", self.var_yolo_classes.get()])
+                cmd.extend(["--yolo-conf", str(self.var_yolo_conf.get())])
+                cmd.extend(["--yolo-model", self.var_yolo_model.get()])
             if self.var_invert_mask.get():
                 cmd.append("--invert-mask")
 
@@ -902,11 +1089,44 @@ class Metashape360GUI:
         if not self.var_fix_upside_down.get():
             cmd.append("--no-fix-rotation")
 
-        if not self.var_lfs_copy_images.get():
+        if not self.var_lfs_copy_images.get() and not self.var_enable_cubemap.get():
+            # --no-copy-images is ignored in split mode (crops are always written)
             cmd.append("--no-copy-images")
+
+        # Cubemap split options
+        if self.var_enable_cubemap.get():
+            cmd.append("--split-cubemap")
+            cmd.extend(["--crop-size", str(self.var_crop_size.get())])
+            cmd.extend(["--fov-deg", str(self.var_fov_deg.get())])
+            skip_dirs = [d for d in VALID_DIRECTIONS if self.var_skip_directions[d].get()]
+            if skip_dirs:
+                cmd.extend(["--skip-directions", ",".join(skip_dirs)])
 
         if self.var_quiet.get():
             cmd.append("--quiet")
+
+        # Mask generation options (same args available in both modes)
+        if self.var_generate_masks.get():
+            cmd.append("--generate-masks")
+            cmd.extend(["--mask-engine", self.var_mask_engine.get()])
+            if self.var_mask_engine.get() == "sam3":
+                cmd.extend(["--sam3-model", self.var_sam3_model.get()])
+                cmd.extend(["--sam3-concepts", self.var_sam3_concepts.get()])
+                cmd.extend(["--sam3-conf", str(self.var_sam3_conf.get())])
+                if not self.var_sam3_half.get():
+                    cmd.append("--no-sam3-half")
+            else:
+                cmd.extend(["--yolo-model", self.var_yolo_model.get()])
+                yolo_cls = self.var_yolo_classes.get().strip()
+                if yolo_cls:
+                    cmd.extend(["--yolo-classes", yolo_cls])
+                cmd.extend(["--yolo-conf", str(self.var_yolo_conf.get())])
+            if self.var_invert_mask.get():
+                cmd.append("--invert-mask")
+        if self.var_mask_overexposure.get():
+            cmd.append("--mask-overexposure")
+            cmd.extend(["--overexposure-threshold", str(self.var_overexposure_threshold.get())])
+            cmd.extend(["--overexposure-dilate", str(self.var_overexposure_dilate.get())])
 
         return cmd
 
@@ -1166,10 +1386,15 @@ class Metashape360GUI:
         lines.extend([
             "",
             f"generate-masks={self.var_generate_masks.get()}",
+            f"mask-engine={self.var_mask_engine.get()}",
             f"invert-mask={self.var_invert_mask.get()}",
             f"yolo-classes={self.var_yolo_classes.get()}",
             f"yolo-conf={self.var_yolo_conf.get()}",
             f"yolo-model={self.var_yolo_model.get()}",
+            f"sam3-model={self.var_sam3_model.get()}",
+            f"sam3-concepts={self.var_sam3_concepts.get()}",
+            f"sam3-conf={self.var_sam3_conf.get()}",
+            f"sam3-half={self.var_sam3_half.get()}",
             "",
             f"mask-overexposure={self.var_mask_overexposure.get()}",
             f"overexposure-threshold={self.var_overexposure_threshold.get()}",
@@ -1179,6 +1404,7 @@ class Metashape360GUI:
             f"rotate-z180={self.var_rotate_z180.get()}",
             f"fix-upside-down={self.var_fix_upside_down.get()}",
             f"lfs-copy-images={self.var_lfs_copy_images.get()}",
+            f"enable-cubemap={self.var_enable_cubemap.get()}",
             f"apply-component-transform-for-ply={self.var_apply_component.get()}",
             f"quiet={self.var_quiet.get()}",
             f"output-mode={self.var_output_mode.get()}",
@@ -1264,6 +1490,8 @@ class Metashape360GUI:
         
         if "generate-masks" in config:
             self.var_generate_masks.set(parse_bool(config["generate-masks"]))
+        if "mask-engine" in config:
+            self.var_mask_engine.set(config["mask-engine"])
         if "invert-mask" in config:
             self.var_invert_mask.set(parse_bool(config["invert-mask"]))
         if "yolo-classes" in config:
@@ -1272,6 +1500,14 @@ class Metashape360GUI:
             self.var_yolo_conf.set(float(config["yolo-conf"]))
         if "yolo-model" in config:
             self.var_yolo_model.set(config["yolo-model"])
+        if "sam3-model" in config:
+            self.var_sam3_model.set(config["sam3-model"])
+        if "sam3-concepts" in config:
+            self.var_sam3_concepts.set(config["sam3-concepts"])
+        if "sam3-conf" in config:
+            self.var_sam3_conf.set(float(config["sam3-conf"]))
+        if "sam3-half" in config:
+            self.var_sam3_half.set(parse_bool(config["sam3-half"]))
         
         if "mask-overexposure" in config:
             self.var_mask_overexposure.set(parse_bool(config["mask-overexposure"]))
@@ -1288,6 +1524,11 @@ class Metashape360GUI:
             self.var_fix_upside_down.set(parse_bool(config["fix-upside-down"]))
         if "lfs-copy-images" in config:
             self.var_lfs_copy_images.set(parse_bool(config["lfs-copy-images"]))
+        # Support both new key and legacy key from older config files.
+        if "enable-cubemap" in config:
+            self.var_enable_cubemap.set(parse_bool(config["enable-cubemap"]))
+        elif "lfs-split-cubemap" in config:
+            self.var_enable_cubemap.set(parse_bool(config["lfs-split-cubemap"]))
         if "apply-component-transform-for-ply" in config:
             self.var_apply_component.set(parse_bool(config["apply-component-transform-for-ply"]))
         if "quiet" in config:
@@ -1296,11 +1537,9 @@ class Metashape360GUI:
             self.var_output_mode.set(config["output-mode"])
         if "language" in config and config["language"] in UI_TEXT:
             self.var_language.set(config["language"])
-        
-        self.toggle_mask_options()
-        self.toggle_overexposure_options()
+
         self.toggle_mode_ui()
-        
+
         self.log(f"{self.t('loaded', path=filepath)}\n")
 
         if "language" in config and config["language"] in UI_TEXT:
