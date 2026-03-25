@@ -22,12 +22,13 @@ DEFAULTS = {
     "xml": "./cameras.xml",
     "ply": "./sparse_point_cloud.ply",
     "output": "./colmap_dataset/",
+    "output_mode": "COLMAP",
     "crop_size": 1920,
     "fov_deg": 90.0,
     "max_images": 10000,
-    "range_start": 1,
+    "range_start": 0,
     "range_end": 10000,
-    "num_workers": 4,
+    "num_workers": min(multiprocessing.cpu_count(), 8),
     "generate_masks": True,
     "invert_mask": False,
     "yaw_offset": 0.0,
@@ -41,6 +42,8 @@ DEFAULTS = {
     "apply_component_transform": False,
     "flip_vertical": True,
     "rotate_z180": True,
+    "fix_upside_down": True,
+    "lfs_copy_images": True,
     "language": "EN",
 }
 
@@ -131,6 +134,14 @@ UI_TEXT = {
         "tip_overexp_threshold": "Treat pixels as overexposed when all RGB channels exceed this value",
         "tip_overexp_dilate": "Dilation amount to cover fringe artifacts around masks (pixels)",
         "tip_flip_vertical": "Flip Y-axis during equirectangular image sampling",
+        "output_mode": "Output Mode:",
+        "mode_colmap": "COLMAP / PostShot (cubemap crops)",
+        "mode_lfs": "Licht-Feld Studio (transforms.json)",
+        "fix_upside_down": "Fix upside-down orientation (+90° X rotation)",
+        "tip_fix_upside_down": "Apply +90° rotation around X-axis to correct upside-down scenes in LFS",
+        "lfs_copy_images": "Copy images to output folder",
+        "tip_lfs_copy_images": "Copy source images into output/images/ and use relative paths in transforms.json (recommended for portability)",
+        "tip_mode": "COLMAP mode: generates 6 cubemap crops + cameras.txt/images.txt.  LFS mode: generates transforms.json for Licht-Feld Studio directly.",
     },
     "JP": {
         "app_title": "Metashape 360° to COLMAP コンバーター",
@@ -209,6 +220,14 @@ UI_TEXT = {
         "tip_overexp_threshold": "全RGBチャンネルがこの値を超えるピクセルを露出オーバーとみなす",
         "tip_overexp_dilate": "マスク周辺のフリンジアーティファクトをカバーする膨張量 (pixels)",
         "tip_flip_vertical": "Equirectangular画像サンプリング時のY軸反転",
+        "output_mode": "出力モード:",
+        "mode_colmap": "COLMAP / PostShot (Cubemapクロップ)",
+        "mode_lfs": "Licht-Feld Studio (transforms.json)",
+        "fix_upside_down": "上下反転を修正 (+90° X軸回転)",
+        "tip_fix_upside_down": "LFSで逆さまのシーンを補正するX軸+90°回転を適用",
+        "lfs_copy_images": "画像を出力フォルダにコピー",
+        "tip_lfs_copy_images": "ソース画像をoutput/images/にコピーしてtransforms.jsonで相対パスを使用 (可搬性のため推奨)",
+        "tip_mode": "COLMAPモード: 6面Cubemapクロップ＋cameras.txt/images.txtを生成。LFSモード: Licht-Feld Studio用transforms.jsonを直接生成。",
     },
 }
 
@@ -309,10 +328,13 @@ class Metashape360GUI:
         # Advanced options
         self.var_flip_vertical = tk.BooleanVar(value=DEFAULTS["flip_vertical"])
         self.var_rotate_z180 = tk.BooleanVar(value=DEFAULTS["rotate_z180"])
+        self.var_fix_upside_down = tk.BooleanVar(value=DEFAULTS["fix_upside_down"])
+        self.var_lfs_copy_images = tk.BooleanVar(value=DEFAULTS["lfs_copy_images"])
         self.var_apply_component = tk.BooleanVar(value=DEFAULTS["apply_component_transform"])
         self.var_quiet = tk.BooleanVar(value=DEFAULTS["quiet"])
         self.var_language = tk.StringVar(value=DEFAULTS["language"])
         self.var_advanced_expanded = tk.BooleanVar(value=False)
+        self.var_output_mode = tk.StringVar(value=DEFAULTS["output_mode"])
 
     def t(self, key, **kwargs):
         """Get localized UI text."""
@@ -381,6 +403,30 @@ class Metashape360GUI:
         lang_combo.pack(side="left")
         lang_combo.bind("<<ComboboxSelected>>", self.on_language_changed)
         
+        # ===== Output Mode Selector =====
+        mode_frame = ttk.LabelFrame(scrollable_frame, text=self.t("output_mode"), padding=8)
+        mode_frame.pack(fill="x", padx=padx, pady=(0, pady))
+
+        rb_colmap = ttk.Radiobutton(
+            mode_frame,
+            text=self.t("mode_colmap"),
+            variable=self.var_output_mode,
+            value="COLMAP",
+            command=self.toggle_mode_ui,
+        )
+        rb_colmap.pack(side="left", padx=10)
+        ToolTip(rb_colmap, self.t("tip_mode"))
+
+        rb_lfs = ttk.Radiobutton(
+            mode_frame,
+            text=self.t("mode_lfs"),
+            variable=self.var_output_mode,
+            value="LFS",
+            command=self.toggle_mode_ui,
+        )
+        rb_lfs.pack(side="left", padx=10)
+        ToolTip(rb_lfs, self.t("tip_mode"))
+        
         # ===== File Paths Section =====
         paths_frame = ttk.LabelFrame(scrollable_frame, text=self.t("paths_section"), padding=10)
         paths_frame.pack(fill="x", padx=padx, pady=pady)
@@ -405,7 +451,7 @@ class Metashape360GUI:
                            is_folder=True, row=3,
                            tooltip=self.t("tip_output"))
         
-        # ===== Tabbed Options Section =====
+        # ===== Tabbed Options Section (COLMAP-only) =====
         self.options_notebook = ttk.Notebook(scrollable_frame)
         self.options_notebook.pack(fill="x", padx=padx, pady=pady)
 
@@ -559,23 +605,41 @@ class Metashape360GUI:
         flip_cb.grid(row=0, column=0, sticky="w", padx=5)
         ToolTip(flip_cb, self.t("tip_flip_vertical"))
 
-        ttk.Checkbutton(
+        self.rotate_z180_cb = ttk.Checkbutton(
             self.adv_content_frame,
             text=self.t("rotate_z180"),
             variable=self.var_rotate_z180,
-        ).grid(row=0, column=1, sticky="w", padx=5)
+        )
+        self.rotate_z180_cb.grid(row=0, column=1, sticky="w", padx=5)
 
-        ttk.Checkbutton(
+        self.apply_component_cb = ttk.Checkbutton(
             self.adv_content_frame,
             text=self.t("apply_component"),
             variable=self.var_apply_component,
-        ).grid(row=1, column=0, sticky="w", padx=5)
+        )
+        self.apply_component_cb.grid(row=1, column=0, sticky="w", padx=5)
 
         ttk.Checkbutton(
             self.adv_content_frame,
             text=self.t("quiet"),
             variable=self.var_quiet,
         ).grid(row=1, column=1, sticky="w", padx=5)
+
+        self.fix_upside_down_cb = ttk.Checkbutton(
+            self.adv_content_frame,
+            text=self.t("fix_upside_down"),
+            variable=self.var_fix_upside_down,
+        )
+        self.fix_upside_down_cb.grid(row=2, column=0, sticky="w", padx=5)
+        ToolTip(self.fix_upside_down_cb, self.t("tip_fix_upside_down"))
+
+        self.lfs_copy_images_cb = ttk.Checkbutton(
+            self.adv_content_frame,
+            text=self.t("lfs_copy_images"),
+            variable=self.var_lfs_copy_images,
+        )
+        self.lfs_copy_images_cb.grid(row=2, column=1, sticky="w", padx=5)
+        ToolTip(self.lfs_copy_images_cb, self.t("tip_lfs_copy_images"))
 
         self.update_advanced_section_visibility()
         
@@ -612,6 +676,9 @@ class Metashape360GUI:
         if old_log:
             self.console.insert(tk.END, old_log)
             self.console.see(tk.END)
+        
+        # Apply mode-dependent visibility for the current mode selection
+        self.toggle_mode_ui()
     
     def add_path_entry(self, parent, label, variable, is_folder=True, row=0, 
                        filetypes=None, tooltip=None):
@@ -654,7 +721,7 @@ class Metashape360GUI:
         for child in self.yolo_frame.winfo_children():
             try:
                 child.config(state=state)
-            except:
+            except tk.TclError:
                 pass
     
     def toggle_overexposure_options(self):
@@ -663,7 +730,7 @@ class Metashape360GUI:
         for child in self.overexposure_frame.winfo_children():
             try:
                 child.config(state=state)
-            except:
+            except tk.TclError:
                 pass
 
     def update_advanced_section_visibility(self):
@@ -680,6 +747,26 @@ class Metashape360GUI:
         """Toggle expanded/collapsed state for advanced options."""
         self.var_advanced_expanded.set(not self.var_advanced_expanded.get())
         self.update_advanced_section_visibility()
+
+    def toggle_mode_ui(self):
+        """Show/hide COLMAP-specific vs LFS-specific UI widgets based on output mode."""
+        is_colmap = self.var_output_mode.get() == "COLMAP"
+
+        # Show or hide the full COLMAP options notebook (crop, skip, mask tabs)
+        if is_colmap:
+            self.options_notebook.pack(fill="x", padx=10, pady=5)
+        else:
+            self.options_notebook.pack_forget()
+
+        # Toggle COLMAP-only advanced checkboxes
+        colmap_only_state = "normal" if is_colmap else "disabled"
+        self.rotate_z180_cb.config(state=colmap_only_state)
+        self.apply_component_cb.config(state=colmap_only_state)
+
+        # Toggle LFS-only advanced checkboxes
+        lfs_only_state = "normal" if not is_colmap else "disabled"
+        self.fix_upside_down_cb.config(state=lfs_only_state)
+        self.lfs_copy_images_cb.config(state=lfs_only_state)
     
     def reset_defaults(self):
         """Reset all settings to defaults."""
@@ -705,8 +792,11 @@ class Metashape360GUI:
         self.var_overexposure_dilate.set(DEFAULTS["overexposure_dilate"])
         self.var_flip_vertical.set(DEFAULTS["flip_vertical"])
         self.var_rotate_z180.set(DEFAULTS["rotate_z180"])
+        self.var_fix_upside_down.set(DEFAULTS["fix_upside_down"])
+        self.var_lfs_copy_images.set(DEFAULTS["lfs_copy_images"])
         self.var_apply_component.set(DEFAULTS["apply_component_transform"])
         self.var_quiet.set(DEFAULTS["quiet"])
+        self.var_output_mode.set(DEFAULTS["output_mode"])
         
         for d in VALID_DIRECTIONS:
             self.var_skip_directions[d].set(False)
@@ -714,56 +804,57 @@ class Metashape360GUI:
         self.toggle_range()
         self.toggle_mask_options()
         self.toggle_overexposure_options()
+        self.toggle_mode_ui()
         
         self.log(f"{self.t('reset_done')}\n")
     
     def build_command(self):
-        """Build the command line arguments."""
-        # In development we launch the Python script directly.
-        # In frozen mode we launch a companion CLI executable from the same folder.
+        """Build the command line arguments based on the selected output mode."""
+        if self.var_output_mode.get() == "LFS":
+            return self._build_lfs_cmd()
+        return self._build_colmap_cmd()
+
+    def _get_base_python_cmd(self, script_name: str) -> list:
+        """Return the base interpreter + script invocation for a given script name."""
         if getattr(sys, "frozen", False):
-            cli_exe = self.get_app_base_dir() / "metashape_360_to_colmap.exe"
-            if not cli_exe.exists():
+            exe = self.get_app_base_dir() / script_name.replace(".py", ".exe")
+            if not exe.exists():
                 raise FileNotFoundError(
-                    f"Required converter executable was not found: {cli_exe}"
+                    f"Required converter executable was not found: {exe}"
                 )
-            cmd = [str(cli_exe)]
-        else:
-            script_path = self.get_app_base_dir() / "metashape_360_to_colmap.py"
-            # Prefer the venv Python next to this script so all dependencies are available
-            # regardless of which interpreter was used to launch the GUI.
-            venv_python = self.get_app_base_dir() / ".venv" / "Scripts" / "python.exe"
-            if not venv_python.exists():
-                venv_python = self.get_app_base_dir() / ".venv" / "bin" / "python"
-            python_exe = str(venv_python) if venv_python.exists() else sys.executable
-            # Use unbuffered mode so stdout/stderr is streamed to the GUI log in real time.
-            cmd = [python_exe, "-u", str(script_path)]
-        
-        # Required paths
+            return [str(exe)]
+
+        script_path = self.get_app_base_dir() / script_name
+        venv_python = self.get_app_base_dir() / ".venv" / "Scripts" / "python.exe"
+        if not venv_python.exists():
+            venv_python = self.get_app_base_dir() / ".venv" / "bin" / "python"
+        python_exe = str(venv_python) if venv_python.exists() else sys.executable
+        return [python_exe, "-u", str(script_path)]
+
+    def _build_colmap_cmd(self) -> list:
+        """Build command arguments for metashape_360_to_colmap.py."""
+        cmd = self._get_base_python_cmd("metashape_360_to_colmap.py")
+
         cmd.extend(["--images", self.var_images.get()])
         cmd.extend(["--xml", self.var_xml.get()])
         cmd.extend(["--output", self.var_output.get()])
-        
+
         if self.var_ply.get().strip():
             cmd.extend(["--ply", self.var_ply.get()])
-        
-        # Processing options
+
         cmd.extend(["--crop-size", str(self.var_crop_size.get())])
         cmd.extend(["--fov-deg", str(self.var_fov_deg.get())])
         cmd.extend(["--max-images", str(self.var_max_images.get())])
         cmd.extend(["--num-workers", str(self.var_num_workers.get())])
         cmd.extend(["--yaw-offset", str(self.var_yaw_offset.get())])
-        
-        # Range
+
         if self.var_range_enabled.get():
             cmd.extend(["--range-images", f"{self.var_range_start.get()}-{self.var_range_end.get()}"])
-        
-        # Skip directions
+
         skip_dirs = [d for d in VALID_DIRECTIONS if self.var_skip_directions[d].get()]
         if skip_dirs:
             cmd.extend(["--skip-directions", ",".join(skip_dirs)])
-        
-        # Mask options
+
         if self.var_generate_masks.get():
             cmd.append("--generate-masks")
             cmd.extend(["--yolo-classes", self.var_yolo_classes.get()])
@@ -771,30 +862,52 @@ class Metashape360GUI:
             cmd.extend(["--yolo-model", self.var_yolo_model.get()])
             if self.var_invert_mask.get():
                 cmd.append("--invert-mask")
-        
-        # Overexposure mask
+
         if self.var_mask_overexposure.get():
             cmd.append("--mask-overexposure")
             cmd.extend(["--overexposure-threshold", str(self.var_overexposure_threshold.get())])
             cmd.extend(["--overexposure-dilate", str(self.var_overexposure_dilate.get())])
-        
-        # Advanced options
+
         if self.var_flip_vertical.get():
             cmd.append("--flip-vertical")
         else:
             cmd.append("--no-flip-vertical")
-        
+
         if self.var_rotate_z180.get():
             cmd.append("--rotate-z180")
         else:
             cmd.append("--no-rotate-z180")
-        
+
         if self.var_apply_component.get():
             cmd.append("--apply-component-transform-for-ply")
-        
+
         if self.var_quiet.get():
             cmd.append("--quiet")
-        
+
+        return cmd
+
+    def _build_lfs_cmd(self) -> list:
+        """Build command arguments for metashape_360_lfs.py."""
+        cmd = self._get_base_python_cmd("metashape_360_lfs.py")
+
+        cmd.extend(["--images", self.var_images.get()])
+        cmd.extend(["--xml", self.var_xml.get()])
+        cmd.extend(["--output", self.var_output.get()])
+
+        if self.var_ply.get().strip():
+            cmd.extend(["--ply", self.var_ply.get()])
+
+        cmd.extend(["--max-images", str(self.var_max_images.get())])
+
+        if not self.var_fix_upside_down.get():
+            cmd.append("--no-fix-rotation")
+
+        if not self.var_lfs_copy_images.get():
+            cmd.append("--no-copy-images")
+
+        if self.var_quiet.get():
+            cmd.append("--quiet")
+
         return cmd
 
     def get_app_base_dir(self):
@@ -1023,14 +1136,15 @@ class Metashape360GUI:
         if not filepath:
             return
         
+        q = lambda p: f'"{p}"' if " " in p else p
         lines = [
             "# Configuration file for metashape_360_to_colmap.py",
             "# Generated by GUI application",
             "",
-            f"images={self.var_images.get()}",
-            f"xml={self.var_xml.get()}",
-            f"ply={self.var_ply.get()}",
-            f"output={self.var_output.get()}",
+            f"images={q(self.var_images.get())}",
+            f"xml={q(self.var_xml.get())}",
+            f"ply={q(self.var_ply.get())}",
+            f"output={q(self.var_output.get())}",
             "",
             f"crop-size={self.var_crop_size.get()}",
             f"fov-deg={self.var_fov_deg.get()}",
@@ -1063,8 +1177,11 @@ class Metashape360GUI:
             "",
             f"flip-vertical={self.var_flip_vertical.get()}",
             f"rotate-z180={self.var_rotate_z180.get()}",
+            f"fix-upside-down={self.var_fix_upside_down.get()}",
+            f"lfs-copy-images={self.var_lfs_copy_images.get()}",
             f"apply-component-transform-for-ply={self.var_apply_component.get()}",
             f"quiet={self.var_quiet.get()}",
+            f"output-mode={self.var_output_mode.get()}",
             f"language={self.var_language.get()}",
         ])
         
@@ -1167,15 +1284,22 @@ class Metashape360GUI:
             self.var_flip_vertical.set(parse_bool(config["flip-vertical"]))
         if "rotate-z180" in config:
             self.var_rotate_z180.set(parse_bool(config["rotate-z180"]))
+        if "fix-upside-down" in config:
+            self.var_fix_upside_down.set(parse_bool(config["fix-upside-down"]))
+        if "lfs-copy-images" in config:
+            self.var_lfs_copy_images.set(parse_bool(config["lfs-copy-images"]))
         if "apply-component-transform-for-ply" in config:
             self.var_apply_component.set(parse_bool(config["apply-component-transform-for-ply"]))
         if "quiet" in config:
             self.var_quiet.set(parse_bool(config["quiet"]))
+        if "output-mode" in config and config["output-mode"] in ("COLMAP", "LFS"):
+            self.var_output_mode.set(config["output-mode"])
         if "language" in config and config["language"] in UI_TEXT:
             self.var_language.set(config["language"])
         
         self.toggle_mask_options()
         self.toggle_overexposure_options()
+        self.toggle_mode_ui()
         
         self.log(f"{self.t('loaded', path=filepath)}\n")
 

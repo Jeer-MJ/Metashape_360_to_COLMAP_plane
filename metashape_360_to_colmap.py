@@ -22,9 +22,10 @@ Dependencies:
 import argparse
 import configparser
 import multiprocessing
+import shutil
 import sys
 import xml.etree.ElementTree as ET
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -45,6 +46,20 @@ try:
     HAS_YOLO = True
 except ImportError:  # pragma: no cover - optional dependency
     HAS_YOLO = False
+
+# Remap coordinate maps cached per worker process.
+# Keyed by (direction, crop_size, fov_deg, yaw_offset, flip_vertical, equirect_w, equirect_h).
+_remap_cache: Dict[tuple, Tuple[np.ndarray, np.ndarray]] = {}
+
+# YOLO model initialized once per worker process via _init_yolo_worker().
+_worker_yolo_model = None
+
+
+def _init_yolo_worker(model_path: str) -> None:
+    """Load the YOLO segmentation model once per worker process."""
+    global _worker_yolo_model
+    if HAS_YOLO:
+        _worker_yolo_model = YOLO(model_path)
 
 
 def find_param(calib_xml: ET.Element, param_name: str) -> float:
@@ -337,7 +352,6 @@ def create_person_mask_from_yolo(
 def generate_mask_and_save(
     image_path: str,
     output_mask_path: str,
-    yolo_model_path: str,
     yolo_conf: float = 0.25,
     invert_mask: bool = False,
     class_ids: Optional[list] = None,
@@ -346,38 +360,32 @@ def generate_mask_and_save(
     overexposure_dilate: int = 5,
 ) -> Tuple[str, str]:
     """Generate object mask and save to file (for parallel processing).
-    
+
+    Uses the YOLO model pre-loaded per worker via _init_yolo_worker().
+
     Args:
         image_path: Path to the equirectangular image
         output_mask_path: Path to save the mask
-        yolo_model_path: Path to YOLO model
         yolo_conf: Minimum YOLO confidence score (0.0-1.0) to keep detections
         invert_mask: Whether to invert the mask
         class_ids: List of YOLO class IDs to include in mask
         mask_overexposure: Whether to also mask overexposed pixels
         overexposure_threshold: Pixel value threshold for overexposure detection
         overexposure_dilate: Dilation radius for overexposure mask
-    
+
     Returns:
         Tuple of (image_path, output_mask_path)
     """
-    if not HAS_YOLO:
-        raise ImportError("ultralytics is required")
-    
-    # Load YOLO model in worker process
-    yolo_model = YOLO(yolo_model_path)
-    
-    # Generate mask
+    if not HAS_YOLO or _worker_yolo_model is None:
+        raise RuntimeError("YOLO model not initialized in worker process")
+
     mask = create_person_mask_from_yolo(
-        image_path, yolo_model, yolo_conf, invert_mask, class_ids,
+        image_path, _worker_yolo_model, yolo_conf, invert_mask, class_ids,
         mask_overexposure=mask_overexposure,
         overexposure_threshold=overexposure_threshold,
         overexposure_dilate=overexposure_dilate,
     )
-    
-    # Save mask
     mask.save(output_mask_path)
-    
     return (image_path, output_mask_path)
 
 
@@ -421,7 +429,75 @@ def crop_and_save_image(
         cropped_mask.save(output_mask_path)
     
     output_name = Path(output_image_path).name
-    return (direction, output_name, output_image_path, np.array([]))
+    return (direction, output_name)
+
+
+def _compute_remap_maps(
+    direction: str,
+    crop_size: int,
+    fov_deg: float,
+    yaw_offset: float,
+    flip_vertical: bool,
+    equirect_w: int,
+    equirect_h: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute the (map_x, map_y) sampling arrays for cv2.remap.
+
+    Separated from crop_direction so results can be cached per worker process.
+    """
+    w_out = h_out = crop_size
+    fx = fy = (w_out / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+    cx = cy = (w_out - 1) / 2.0
+    u, v = np.meshgrid(np.arange(w_out, dtype=np.float32), np.arange(h_out, dtype=np.float32))
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    z = np.ones_like(x)
+    dirs = np.stack([x, y, z], axis=-1)
+    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
+
+    R = get_direction_rotation_matrix(direction).astype(np.float32)
+    if yaw_offset != 0.0:
+        yaw_rad = np.radians(yaw_offset)
+        cos_y = np.cos(yaw_rad)
+        sin_y = np.sin(yaw_rad)
+        R_yaw_offset = np.array([
+            [cos_y, 0, sin_y],
+            [0, 1, 0],
+            [-sin_y, 0, cos_y],
+        ], dtype=np.float32)
+        R = R_yaw_offset @ R
+
+    dirs = dirs @ R.T
+
+    lon = np.arctan2(dirs[..., 0], dirs[..., 2])
+    lat = np.arctan2(dirs[..., 1], np.sqrt(dirs[..., 0] ** 2 + dirs[..., 2] ** 2))
+
+    map_x = (lon / (2 * np.pi) + 0.5) * float(equirect_w)
+    if flip_vertical:
+        map_y = (0.5 + lat / np.pi) * float(equirect_h)
+    else:
+        map_y = (0.5 - lat / np.pi) * float(equirect_h)
+    map_y = np.clip(map_y, 0.0, float(equirect_h - 1))
+
+    return map_x.astype(np.float32), map_y.astype(np.float32)
+
+
+def get_remap_maps(
+    direction: str,
+    crop_size: int,
+    fov_deg: float,
+    yaw_offset: float,
+    flip_vertical: bool,
+    equirect_w: int,
+    equirect_h: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return cached remap maps, computing them on first use within each worker process."""
+    key = (direction, crop_size, fov_deg, yaw_offset, flip_vertical, equirect_w, equirect_h)
+    if key not in _remap_cache:
+        _remap_cache[key] = _compute_remap_maps(
+            direction, crop_size, fov_deg, yaw_offset, flip_vertical, equirect_w, equirect_h
+        )
+    return _remap_cache[key]
 
 
 def crop_direction(
@@ -433,58 +509,22 @@ def crop_direction(
     yaw_offset: float = 0.0,
 ) -> Image.Image:
     """Rectilinear 90° crop from equirectangular using cv2.remap (cube map layout).
-    
+
     Extracts 6 directions (top/front/right/back/left/bottom) like a cube map unfolding.
-    
+    Remap coordinate maps are cached per worker process for performance.
+
     Args:
         yaw_offset: Additional yaw rotation in degrees to apply to the crop direction.
                    Use this to rotate the cubemap extraction angle per frame.
     """
-    # Prepare output grid (pixel centers).
-    w_out = h_out = crop_size
-    fx = fy = (w_out / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
-    cx = cy = (w_out - 1) / 2.0
-    u, v = np.meshgrid(np.arange(w_out, dtype=np.float32), np.arange(h_out, dtype=np.float32))
-    x = (u - cx) / fx
-    y = (v - cy) / fy
-    z = np.ones_like(x)
-    dirs = np.stack([x, y, z], axis=-1)
-    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
-
-    # Apply rotation matrix for this direction (both yaw and pitch) plus yaw offset.
-    R = get_direction_rotation_matrix(direction).astype(np.float32)
-    
-    # Apply additional yaw offset rotation
-    if yaw_offset != 0.0:
-        yaw_rad = np.radians(yaw_offset)
-        cos_y = np.cos(yaw_rad)
-        sin_y = np.sin(yaw_rad)
-        R_yaw_offset = np.array([
-            [cos_y, 0, sin_y],
-            [0, 1, 0],
-            [-sin_y, 0, cos_y],
-        ], dtype=np.float32)
-        R = R_yaw_offset @ R
-    
-    dirs = dirs @ R.T
-
-    # Convert direction vectors to equirectangular UV.
-    lon = np.arctan2(dirs[..., 0], dirs[..., 2])  # [-pi, pi]
-    lat = np.arctan2(dirs[..., 1], np.sqrt(dirs[..., 0] ** 2 + dirs[..., 2] ** 2))  # [-pi/2, pi/2]
-
     width, height = equirect_image.size
-    map_x = (lon / (2 * np.pi) + 0.5) * float(width)
-    map_y = (0.5 - lat / np.pi) * float(height)
-    if flip_vertical:
-        map_y = (0.5 + lat / np.pi) * float(height)
-    map_y = np.clip(map_y, 0.0, float(height - 1))
+    map_x, map_y = get_remap_maps(direction, crop_size, fov_deg, yaw_offset, flip_vertical, width, height)
 
-    # Remap (wrap horizontally, clamp vertically).
     equirect_np = np.array(equirect_image.convert("RGB"))
     sampled = cv2.remap(
         equirect_np,
-        map_x.astype(np.float32),
-        map_y.astype(np.float32),
+        map_x,
+        map_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_WRAP,
     )
@@ -567,10 +607,8 @@ def convert_metashape_to_colmap(
     component_dict = xml_data["component_dict"]
     cameras_xml = xml_data["cameras"]
 
-    image_extensions = [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp"]
-    image_files = []
-    for ext in image_extensions:
-        image_files.extend(images_dir.glob(f"*{ext}"))
+    image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp"}
+    image_files = [p for p in images_dir.iterdir() if p.suffix.lower() in image_extensions]
 
     image_filename_map = {img_path.stem: img_path for img_path in image_files}
     image_filename_map.update({img_path.name: img_path for img_path in image_files})
@@ -670,15 +708,6 @@ def convert_metashape_to_colmap(
             print(f"First camera '{camera_label}' component_id: {component_id} (NOT found in component_dict)")
 
         src_image_path = image_filename_map[camera_label]
-        try:
-            # Test if image can be loaded
-            test_img = Image.open(src_image_path)
-            test_img.close()
-        except Exception as exc:  # pragma: no cover - IO guard
-            if verbose:
-                print(f"  Skipping {camera_label}: failed to load image ({exc})")
-            num_skipped += 1
-            continue
 
         R_c2w = transform[:3, :3]
         t_c2w = transform[:3, 3]
@@ -720,29 +749,32 @@ def convert_metashape_to_colmap(
             tmp_mask_name = f"{base_name}_mask.png"
             tmp_mask_path = str(tmp_masks_dir / tmp_mask_name)
             mask_generation_tasks.append((
-                src_image_path, tmp_mask_path, yolo_model_path, yolo_conf, invert_mask, yolo_classes,
+                src_image_path, tmp_mask_path, yolo_conf, invert_mask, yolo_classes,
                 mask_overexposure, overexposure_threshold, overexposure_dilate,
             ))
         
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = []
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_yolo_worker,
+            initargs=(yolo_model_path,),
+        ) as executor:
+            futures_to_src = {}
             for task in mask_generation_tasks:
-                futures.append(
-                    executor.submit(
-                        generate_mask_and_save,
-                        task[0],
-                        task[1],
-                        task[2],
-                        task[3],
-                        task[4],
-                        task[5],
-                        task[6],
-                        task[7],
-                        task[8],
-                    )
+                future = executor.submit(
+                    generate_mask_and_save,
+                    task[0],
+                    task[1],
+                    task[2],
+                    task[3],
+                    task[4],
+                    task[5],
+                    task[6],
+                    task[7],
                 )
+                futures_to_src[future] = task[0]
 
-            total_masks = len(futures)
+            total_masks = len(futures_to_src)
+            completed_masks = 0
             report_interval = max(1, total_masks // 20)
             next_report = report_interval
             use_inline_progress = sys.stdout.isatty()
@@ -750,26 +782,25 @@ def convert_metashape_to_colmap(
             if verbose and use_inline_progress:
                 print(f"  Mask progress: 0/{total_masks} (0.0%)", end="\r", flush=True)
             
-            for idx, future in enumerate(futures):
+            for future in as_completed(futures_to_src):
+                completed_masks += 1
                 try:
                     image_path, mask_path = future.result()
                     equirect_mask_paths[image_path] = mask_path
                 except Exception as exc:
                     if verbose:
-                        print(f"  Error generating mask {idx + 1}: {exc}")
-                    continue
+                        print(f"  Error generating mask: {exc}")
 
-                completed = idx + 1
-                if verbose and (completed >= next_report or completed == total_masks):
+                if verbose and (completed_masks >= next_report or completed_masks == total_masks):
                     progress_msg = (
-                        f"  Mask progress: {completed}/{total_masks} "
-                        f"({(completed / total_masks) * 100:.1f}%)"
+                        f"  Mask progress: {completed_masks}/{total_masks} "
+                        f"({(completed_masks / total_masks) * 100:.1f}%)"
                     )
                     if use_inline_progress:
                         print(progress_msg, end="\r", flush=True)
                     else:
                         print(progress_msg)
-                    while next_report <= completed:
+                    while next_report <= completed_masks:
                         next_report += report_interval
 
             if verbose and use_inline_progress:
@@ -815,6 +846,7 @@ def convert_metashape_to_colmap(
                 )
 
             total_crops = len(futures)
+            completed_crops = 0
             # Report progress in small, readable increments (about every 5%).
             report_interval = max(1, total_crops // 20)
             next_report = report_interval
@@ -823,25 +855,24 @@ def convert_metashape_to_colmap(
             if verbose and use_inline_progress:
                 print(f"  Cropping progress: 0/{total_crops} (0.0%)", end="\r", flush=True)
             
-            for idx, future in enumerate(futures):
+            for future in as_completed(futures):
+                completed_crops += 1
                 try:
                     future.result()
                 except Exception as exc:
                     if verbose:
-                        print(f"  Error processing crop {idx + 1}: {exc}")
-                    continue
+                        print(f"  Error processing crop: {exc}")
 
-                completed = idx + 1
-                if verbose and (completed >= next_report or completed == total_crops):
+                if verbose and (completed_crops >= next_report or completed_crops == total_crops):
                     progress_msg = (
-                        f"  Cropping progress: {completed}/{total_crops} "
-                        f"({(completed / total_crops) * 100:.1f}%)"
+                        f"  Cropping progress: {completed_crops}/{total_crops} "
+                        f"({(completed_crops / total_crops) * 100:.1f}%)"
                     )
                     if use_inline_progress:
                         print(progress_msg, end="\r", flush=True)
                     else:
                         print(progress_msg)
-                    while next_report <= completed:
+                    while next_report <= completed_crops:
                         next_report += report_interval
 
             if verbose and use_inline_progress:
@@ -998,6 +1029,10 @@ def convert_metashape_to_colmap(
 
     if verbose:
         print(f"Wrote cameras.txt, images.txt, points3D.txt to {output_dir}")
+
+    # Remove temporary equirectangular mask files generated during processing
+    if tmp_masks_dir is not None and tmp_masks_dir.exists():
+        shutil.rmtree(tmp_masks_dir, ignore_errors=True)
 
     return {
         "num_images": len(images_colmap),
