@@ -730,8 +730,14 @@ class Metashape360GUI:
             cmd = [str(cli_exe)]
         else:
             script_path = self.get_app_base_dir() / "metashape_360_to_colmap.py"
+            # Prefer the venv Python next to this script so all dependencies are available
+            # regardless of which interpreter was used to launch the GUI.
+            venv_python = self.get_app_base_dir() / ".venv" / "Scripts" / "python.exe"
+            if not venv_python.exists():
+                venv_python = self.get_app_base_dir() / ".venv" / "bin" / "python"
+            python_exe = str(venv_python) if venv_python.exists() else sys.executable
             # Use unbuffered mode so stdout/stderr is streamed to the GUI log in real time.
-            cmd = [sys.executable, "-u", str(script_path)]
+            cmd = [python_exe, "-u", str(script_path)]
         
         # Required paths
         cmd.extend(["--images", self.var_images.get()])
@@ -853,6 +859,8 @@ class Metashape360GUI:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                     universal_newlines=True,
                     cwd=str(self.get_app_base_dir()),
