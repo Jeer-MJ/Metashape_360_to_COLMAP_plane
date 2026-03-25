@@ -686,11 +686,11 @@ def convert_metashape_to_lichtfeld(
                 lfs_transform = transform_camera_matrix(face_transform, fix_upside_down)
 
                 # Crop and save the perspective face image
-                output_image_name = f"{base_name}_{direction}.jpg"
+                output_image_name = f"{base_name}_{direction}.png"
                 output_image_path = images_output_dir / output_image_name
                 if not output_image_path.exists():
                     cropped = _lfs_crop_face(equirect_img, direction, crop_size, fov_deg)
-                    cropped.save(str(output_image_path), quality=100)
+                    cropped.save(str(output_image_path), compress_level=0)
                 elif do_masking:
                     # Need the crop for mask generation even when image already exists.
                     cropped = _lfs_crop_face(equirect_img, direction, crop_size, fov_deg)

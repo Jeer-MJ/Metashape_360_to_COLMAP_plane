@@ -543,7 +543,7 @@ def crop_and_save_image(
         flip_vertical=flip_vertical,
         yaw_offset=yaw_offset,
     )
-    cropped.save(output_image_path, quality=100)
+    cropped.save(output_image_path, compress_level=0)
     
     # Crop and save mask if provided
     if mask_image_path is not None and output_mask_path is not None:
@@ -891,7 +891,7 @@ def convert_metashape_to_colmap(
 
         # Queue tasks for each direction
         for direction in directions:
-            output_image_name = f"{base_name}_{direction}.jpg"
+            output_image_name = f"{base_name}_{direction}.png"
             output_image_path = str(images_output_dir / output_image_name)
             crop_tasks.append((str(src_image_path), direction, crop_size, output_image_path, fov_deg, flip_vertical, current_yaw_offset))
             camera_metadata.append((base_name, direction, R_c2w, t_c2w, current_yaw_offset))
@@ -1043,7 +1043,7 @@ def convert_metashape_to_colmap(
                     mask_file_path = equirect_mask_paths.get(src_image_path)
                     if mask_file_path is not None:
                         output_image_name = Path(output_image_path).name
-                        output_mask_name = output_image_name.replace(".jpg", ".png")
+                        output_mask_name = Path(output_image_name).stem + ".png"
                         output_mask_path = str(masks_output_dir / output_mask_name)
                 
                 futures.append(
@@ -1097,7 +1097,7 @@ def convert_metashape_to_colmap(
 
     # Build images_colmap from results
     for idx, (base_name, direction, R_c2w, t_c2w, yaw_offset) in enumerate(camera_metadata):
-        output_image_name = f"{base_name}_{direction}.jpg"
+        output_image_name = f"{base_name}_{direction}.png"
         
         R_dir = get_direction_rotation_matrix(direction)
         
