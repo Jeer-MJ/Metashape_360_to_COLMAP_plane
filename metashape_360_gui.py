@@ -61,6 +61,14 @@ DEFAULTS = {
     "sharp_frame_window_size": 15,
     "sharp_frame_sensitivity": 50,
     "sharp_frame_output": "",
+    "video_enabled": False,
+    "video_path": "",
+    "video_mode": "every-n",
+    "video_every_n": 10,
+    "video_fps": 2.0,
+    "video_start_time": 0.0,
+    "video_end_time": 0.0,
+    "video_output": "",
 }
 
 VALID_DIRECTIONS = ["top", "front", "right", "back", "left", "bottom"]
@@ -161,6 +169,8 @@ UI_TEXT = {
         "output_mode": "Output Mode:",
         "mode_colmap": "COLMAP / PostShot (cubemap crops)",
         "mode_lfs": "Licht-Feld Studio (transforms.json)",
+        "mode_sharp_frame": "Sharp Frame Only (no XML/3D)",
+        "tip_mode_sharp_frame": "Scan an image folder and select only the sharpest frames. No Metashape XML or PLY file required. Requires: pip install sharp-frames",
         "fix_upside_down": "Fix upside-down orientation (+90° X rotation)",
         "tip_fix_upside_down": "Apply +90° rotation around X-axis to correct upside-down scenes in LFS",
         "lfs_copy_images": "Copy images to output folder",
@@ -192,6 +202,28 @@ UI_TEXT = {
         "tip_sf_sensitivity": "0 = keep more frames, 100 = remove aggressively (outlier-removal method)",
         "tip_sf_output": "Folder where selected sharp frames are written. Leave empty to auto-derive as <images_folder>_sharp/",
         "sf_note": "Requires: pip install sharp-frames",
+        "vid_section": "Video Frame Extraction",
+        "vid_enable": "Extract frames from video before conversion",
+        "vid_path": "Video File:",
+        "vid_mode_label": "Mode:",
+        "vid_mode_every_n": "every-N (frame interval)",
+        "vid_mode_fps": "at FPS (target rate)",
+        "vid_every_n": "Every N frames:",
+        "vid_fps": "Target FPS:",
+        "vid_start_time": "Start (s):",
+        "vid_end_time": "End (s):",
+        "vid_time_note": "(0 = beginning / end of video)",
+        "vid_output": "Output folder (empty = auto):",
+        "tip_vid_enable": "Extract image frames from a video file before conversion. Requires: opencv-python (already installed)",
+        "tip_vid_path": "Path to the source video file (MP4, AVI, MOV, MKV, WebM)",
+        "tip_vid_every_n": "Extract one frame every N frames (e.g. 10 = keep 1 in 10 frames)",
+        "tip_vid_fps": "Target extraction rate in frames per second (e.g. 2.0 = 2 frames/s)",
+        "tip_vid_output": "Folder where extracted frames are saved. Leave empty to auto-derive as <video_name>_frames/",
+        "err_video_required": "Please specify a video file",
+        "err_video_missing": "Video file not found: {path}",
+        "sf_run_extract": "▶ Run Phase 1: Extract Frames",
+        "sf_run_sharpen": "▶ Run Phase 2: Select Sharp Frames",
+        "sf_only_images_note": "Source: Images Folder (or extracted from video above)",
     },
     "JP": {
         "app_title": "Metashape 360° to COLMAP コンバーター",
@@ -281,6 +313,8 @@ UI_TEXT = {
         "output_mode": "出力モード:",
         "mode_colmap": "COLMAP / PostShot (Cubemapクロップ)",
         "mode_lfs": "Licht-Feld Studio (transforms.json)",
+        "mode_sharp_frame": "シャープフレームのみ (XML/3D不要)",
+        "tip_mode_sharp_frame": "画像フォルダをスキャンして最もシャープなフレームのみを選択します。Metashape XMLもPLYも不要です。要件: pip install sharp-frames",
         "fix_upside_down": "上下反転を修正 (+90° X軸回転)",
         "tip_fix_upside_down": "LFSで逆さまのシーンを補正するX軸+90°回転を適用",
         "lfs_copy_images": "画像を出力フォルダにコピー",
@@ -312,6 +346,28 @@ UI_TEXT = {
         "tip_sf_sensitivity": "0=多めに保持、100=積極的に除去 (outlier-removal手法)",
         "tip_sf_output": "選択されたシャープフレームの書き出し先。空の場合は<images_folder>_sharp/に自動設定。",
         "sf_note": "要件: pip install sharp-frames",
+        "vid_section": "動画フレーム抽出",
+        "vid_enable": "変換前に動画からフレームを抽出",
+        "vid_path": "動画ファイル:",
+        "vid_mode_label": "モード:",
+        "vid_mode_every_n": "every-N (フレーム間隔)",
+        "vid_mode_fps": "at FPS (目標レート)",
+        "vid_every_n": "Nフレームごと:",
+        "vid_fps": "目標FPS:",
+        "vid_start_time": "開始 (秒):",
+        "vid_end_time": "終了 (秒):",
+        "vid_time_note": "(0 = 動画の先頭 / 末尾)",
+        "vid_output": "出力フォルダ (空=自動):",
+        "tip_vid_enable": "変換前に動画ファイルから画像フレームを抽出します。要件: opencv-python (インストール済み)",
+        "tip_vid_path": "ソース動画ファイルのパス (MP4, AVI, MOV, MKV, WebM)",
+        "tip_vid_every_n": "動画からNフレームごとに1枚抽出 (例: 10 = 10枚に1枚)",
+        "tip_vid_fps": "1秒あたりの抽出フレーム数 (例: 2.0 = 毎秒2フレーム)",
+        "tip_vid_output": "抽出フレームの保存先。空の場合は<動画名>_frames/に自動設定。",
+        "err_video_required": "動画ファイルを指定してください",
+        "err_video_missing": "動画ファイルが見つかりません: {path}",
+        "sf_run_extract": "▶ フェーズ1実行: フレーム抽出",
+        "sf_run_sharpen": "▶ フェーズ2実行: シャープフレーム選択",
+        "sf_only_images_note": "入力: 画像フォルダ (または上の動画から抽出)",
     },
 }
 
@@ -438,6 +494,16 @@ class Metashape360GUI:
         self.var_sharp_frame_sensitivity = tk.IntVar(value=DEFAULTS["sharp_frame_sensitivity"])
         self.var_sharp_frame_output = tk.StringVar(value=DEFAULTS["sharp_frame_output"])
 
+        # Video frame extraction
+        self.var_video_enabled = tk.BooleanVar(value=DEFAULTS["video_enabled"])
+        self.var_video_path = tk.StringVar(value=DEFAULTS["video_path"])
+        self.var_video_mode = tk.StringVar(value=DEFAULTS["video_mode"])
+        self.var_video_every_n = tk.IntVar(value=DEFAULTS["video_every_n"])
+        self.var_video_fps = tk.DoubleVar(value=DEFAULTS["video_fps"])
+        self.var_video_start_time = tk.DoubleVar(value=DEFAULTS["video_start_time"])
+        self.var_video_end_time = tk.DoubleVar(value=DEFAULTS["video_end_time"])
+        self.var_video_output = tk.StringVar(value=DEFAULTS["video_output"])
+
     def t(self, key, **kwargs):
         """Get localized UI text."""
         lang = self.var_language.get() if hasattr(self, "var_language") else "EN"
@@ -506,7 +572,7 @@ class Metashape360GUI:
         lang_combo.bind("<<ComboboxSelected>>", self.on_language_changed)
         
         # ===== Output Mode Selector =====
-        mode_frame = ttk.LabelFrame(scrollable_frame, text=self.t("output_mode"), padding=8)
+        self.mode_frame = mode_frame = ttk.LabelFrame(scrollable_frame, text=self.t("output_mode"), padding=8)
         mode_frame.pack(fill="x", padx=padx, pady=(0, pady))
 
         rb_colmap = ttk.Radiobutton(
@@ -529,21 +595,138 @@ class Metashape360GUI:
         rb_lfs.pack(side="left", padx=10)
         ToolTip(rb_lfs, self.t("tip_mode"))
 
+        rb_sf = ttk.Radiobutton(
+            mode_frame,
+            text=self.t("mode_sharp_frame"),
+            variable=self.var_output_mode,
+            value="SHARP_FRAME",
+            command=self.toggle_mode_ui,
+        )
+        rb_sf.pack(side="left", padx=10)
+        ToolTip(rb_sf, self.t("tip_mode_sharp_frame"))
+
+        # ===== Video Frame Extraction Section =====
+        self.vid_lf = vid_lf = ttk.LabelFrame(scrollable_frame, text=self.t("vid_section"), padding=8)
+        vid_lf.pack(fill="x", padx=padx, pady=(0, pady))
+
+        vid_top_row = ttk.Frame(vid_lf)
+        vid_top_row.pack(fill="x")
+
+        vid_enable_cb = ttk.Checkbutton(
+            vid_top_row,
+            text=self.t("vid_enable"),
+            variable=self.var_video_enabled,
+            command=self.toggle_video_options,
+        )
+        vid_enable_cb.pack(side="left", padx=5, pady=(2, 4))
+        ToolTip(vid_enable_cb, self.t("tip_vid_enable"))
+
+        self.vid_inner = ttk.Frame(vid_lf)
+        self.vid_inner.pack(fill="x", padx=5, pady=(0, 4))
+
+        vid_path_row = ttk.Frame(self.vid_inner)
+        vid_path_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(vid_path_row, text=self.t("vid_path")).pack(side="left", padx=5)
+        self.vid_path_entry = ttk.Entry(
+            vid_path_row, textvariable=self.var_video_path, width=42
+        )
+        self.vid_path_entry.pack(side="left", padx=5, fill="x", expand=True)
+        ToolTip(self.vid_path_entry, self.t("tip_vid_path"))
+        ttk.Button(
+            vid_path_row, text=self.t("browse"), width=8,
+            command=lambda: self.browse_file(
+                self.var_video_path,
+                [("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"), ("All files", "*.*")],
+            ),
+        ).pack(side="left", padx=5)
+
+        vid_mode_row = ttk.Frame(self.vid_inner)
+        vid_mode_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(vid_mode_row, text=self.t("vid_mode_label")).pack(side="left", padx=(0, 8))
+        for _vval, _vkey in [("every-n", "vid_mode_every_n"), ("fps", "vid_mode_fps")]:
+            ttk.Radiobutton(
+                vid_mode_row,
+                text=self.t(_vkey),
+                variable=self.var_video_mode,
+                value=_vval,
+                command=self.toggle_video_mode,
+            ).pack(side="left", padx=6)
+
+        self.vid_subopts_container = ttk.Frame(self.vid_inner)
+        self.vid_subopts_container.pack(fill="x", pady=(0, 4))
+
+        self.vid_every_n_frame = ttk.Frame(self.vid_subopts_container)
+        ttk.Label(self.vid_every_n_frame, text=self.t("vid_every_n")).pack(side="left", padx=5)
+        vid_n_spin = ttk.Spinbox(
+            self.vid_every_n_frame, from_=1, to=1000, increment=1,
+            textvariable=self.var_video_every_n, width=8,
+        )
+        vid_n_spin.pack(side="left", padx=5)
+        ToolTip(vid_n_spin, self.t("tip_vid_every_n"))
+
+        self.vid_fps_frame = ttk.Frame(self.vid_subopts_container)
+        ttk.Label(self.vid_fps_frame, text=self.t("vid_fps")).pack(side="left", padx=5)
+        vid_fps_spin = ttk.Spinbox(
+            self.vid_fps_frame, from_=0.1, to=60.0, increment=0.5,
+            textvariable=self.var_video_fps, width=8, format="%.1f",
+        )
+        vid_fps_spin.pack(side="left", padx=5)
+        ToolTip(vid_fps_spin, self.t("tip_vid_fps"))
+
+        vid_time_row = ttk.Frame(self.vid_inner)
+        vid_time_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(vid_time_row, text=self.t("vid_start_time")).pack(side="left", padx=5)
+        ttk.Spinbox(
+            vid_time_row, from_=0.0, to=86400.0, increment=1.0,
+            textvariable=self.var_video_start_time, width=8, format="%.1f",
+        ).pack(side="left", padx=5)
+        ttk.Label(vid_time_row, text=self.t("vid_end_time")).pack(side="left", padx=(10, 5))
+        ttk.Spinbox(
+            vid_time_row, from_=0.0, to=86400.0, increment=1.0,
+            textvariable=self.var_video_end_time, width=8, format="%.1f",
+        ).pack(side="left", padx=5)
+        ttk.Label(vid_time_row, text=self.t("vid_time_note"), foreground="gray").pack(
+            side="left", padx=10
+        )
+
+        vid_out_row = ttk.Frame(self.vid_inner)
+        vid_out_row.pack(fill="x")
+        ttk.Label(vid_out_row, text=self.t("vid_output")).pack(side="left", padx=5)
+        self.vid_output_entry = ttk.Entry(
+            vid_out_row, textvariable=self.var_video_output, width=42
+        )
+        self.vid_output_entry.pack(side="left", padx=5, fill="x", expand=True)
+        ToolTip(self.vid_output_entry, self.t("tip_vid_output"))
+        ttk.Button(
+            vid_out_row, text=self.t("browse"), width=8,
+            command=lambda: self.browse_folder(self.var_video_output),
+        ).pack(side="left", padx=5)
+
+        self.toggle_video_mode()
+        self.toggle_video_options()
+
+        # Per-phase run button (visible only in Sharp Frame Only mode)
+        self.btn_sf_extract = ttk.Button(
+            vid_lf, text=self.t("sf_run_extract"), command=self.run_extract_only
+        )
+        self.btn_sf_extract.pack(fill="x", padx=5, pady=(4, 2))
+        self.btn_sf_extract.pack_forget()  # Hidden until SHARP_FRAME mode
+
         # ===== Sharp Frame Pre-filter Section =====
-        sf_lf = ttk.LabelFrame(scrollable_frame, text=self.t("sf_section"), padding=8)
+        self.sf_lf = sf_lf = ttk.LabelFrame(scrollable_frame, text=self.t("sf_section"), padding=8)
         sf_lf.pack(fill="x", padx=padx, pady=(0, pady))
 
         sf_top_row = ttk.Frame(sf_lf)
         sf_top_row.pack(fill="x")
 
-        sf_enable_cb = ttk.Checkbutton(
+        self.sf_enable_cb = ttk.Checkbutton(
             sf_top_row,
             text=self.t("sf_enable"),
             variable=self.var_sharp_frame_enabled,
             command=self.toggle_sharp_frame_options,
         )
-        sf_enable_cb.pack(side="left", padx=5, pady=(2, 4))
-        ToolTip(sf_enable_cb, self.t("tip_sf_enable"))
+        self.sf_enable_cb.pack(side="left", padx=5, pady=(2, 4))
+        ToolTip(self.sf_enable_cb, self.t("tip_sf_enable"))
 
         ttk.Label(sf_top_row, text=self.t("sf_note"), foreground="gray").pack(
             side="right", padx=10
@@ -628,37 +811,49 @@ class Metashape360GUI:
         self.toggle_sharp_frame_method()
         self.toggle_sharp_frame_options()
 
+        # Per-phase run button (visible only in Sharp Frame Only mode)
+        self.btn_sf_sharpen = ttk.Button(
+            sf_lf, text=self.t("sf_run_sharpen"), command=self.run_sharpen_only
+        )
+        self.btn_sf_sharpen.pack(fill="x", padx=5, pady=(4, 2))
+        self.btn_sf_sharpen.pack_forget()  # Hidden until SHARP_FRAME mode
+
         # ===== File Paths Section =====
-        paths_frame = ttk.LabelFrame(scrollable_frame, text=self.t("paths_section"), padding=10)
-        paths_frame.pack(fill="x", padx=padx, pady=pady)
+        self.paths_frame = ttk.LabelFrame(scrollable_frame, text=self.t("paths_section"), padding=10)
+        self.paths_frame.pack(fill="x", padx=padx, pady=pady)
         
         # Images folder
-        self.add_path_entry(paths_frame, self.t("images_label"), self.var_images,
+        self.add_path_entry(self.paths_frame, self.t("images_label"), self.var_images,
                            is_folder=True, row=0,
                            tooltip=self.t("tip_images"))
         
         # XML file
-        self.add_path_entry(paths_frame, self.t("xml_label"), self.var_xml,
+        self.add_path_entry(self.paths_frame, self.t("xml_label"), self.var_xml,
                            is_folder=False, row=1, filetypes=[("XML files", "*.xml")],
                            tooltip=self.t("tip_xml"))
         
         # PLY file
-        self.add_path_entry(paths_frame, self.t("ply_label"), self.var_ply,
+        self.add_path_entry(self.paths_frame, self.t("ply_label"), self.var_ply,
                            is_folder=False, row=2, filetypes=[("PLY files", "*.ply")],
                            tooltip=self.t("tip_ply"))
         
         # Output folder
-        self.add_path_entry(paths_frame, self.t("output_label"), self.var_output,
+        self.add_path_entry(self.paths_frame, self.t("output_label"), self.var_output,
                            is_folder=True, row=3,
                            tooltip=self.t("tip_output"))
-        
+
+        # Save references to rows that are hidden in Sharp Frame Only mode
+        self.paths_xml_widgets = list(self.paths_frame.grid_slaves(row=1))
+        self.paths_ply_widgets = list(self.paths_frame.grid_slaves(row=2))
+        self.paths_out_widgets = list(self.paths_frame.grid_slaves(row=3))
+
         # ===== Tabbed Options Section (visible in BOTH modes) =====
         self.options_notebook = ttk.Notebook(scrollable_frame)
         self.options_notebook.pack(fill="x", padx=padx, pady=pady)
 
-        proc_tab = ttk.Frame(self.options_notebook, padding=10)
-        cubemap_tab = ttk.Frame(self.options_notebook, padding=10)
-        mask_tab = ttk.Frame(self.options_notebook, padding=10)
+        proc_tab = self.proc_tab = ttk.Frame(self.options_notebook, padding=10)
+        cubemap_tab = self.cubemap_tab = ttk.Frame(self.options_notebook, padding=10)
+        mask_tab = self.mask_tab = ttk.Frame(self.options_notebook, padding=10)
         self.options_notebook.add(proc_tab, text=self.t("proc_section"))
         self.options_notebook.add(cubemap_tab, text=self.t("cubemap_section"))
         self.options_notebook.add(mask_tab, text=self.t("mask_section"))
@@ -1061,9 +1256,77 @@ class Metashape360GUI:
 
     def toggle_mode_ui(self):
         """Enable/disable widgets based on the selected output mode."""
-        is_colmap = self.var_output_mode.get() == "COLMAP"
+        mode = self.var_output_mode.get()
+        is_colmap = mode == "COLMAP"
+        is_sharp_only = mode == "SHARP_FRAME"
 
-        # Notebook is always visible; adjust per-widget state instead.
+        # ── Sharp Frame Only mode: simplified two-phase UI.
+        #    Hide XML/PLY/Output path rows and the processing/cubemap/mask tabs.
+        #    Show the per-phase run buttons inside each section.
+        if is_sharp_only:
+            self.var_sharp_frame_enabled.set(True)
+            if hasattr(self, "sf_enable_cb"):
+                self.sf_enable_cb.config(state="disabled")
+            # Hide XML (row 1), PLY (row 2), Output (row 3) — keep Images (row 0)
+            for w in (getattr(self, "paths_xml_widgets", []) +
+                      getattr(self, "paths_ply_widgets", []) +
+                      getattr(self, "paths_out_widgets", [])):
+                w.grid_remove()
+            # Hide the tabbed options notebook (Processing / Cubemap / Mask)
+            if self.options_notebook.winfo_ismapped():
+                self.options_notebook.pack_forget()
+            # Show the video and sharp-frame sections (hidden in COLMAP/LFS modes)
+            if hasattr(self, "vid_lf") and not self.vid_lf.winfo_ismapped():
+                self.vid_lf.pack(fill="x", padx=10, pady=(0, 5), after=self.mode_frame)
+            if hasattr(self, "sf_lf") and not self.sf_lf.winfo_ismapped():
+                self.sf_lf.pack(fill="x", padx=10, pady=(0, 5), after=self.vid_lf)
+            # Label the sections as phase steps
+            if hasattr(self, "vid_lf"):
+                self.vid_lf.config(text=f"\u2460 {self.t('vid_section')}")
+            if hasattr(self, "sf_lf"):
+                self.sf_lf.config(text=f"\u2461 {self.t('sf_section')}")
+            # Show the individual phase run buttons
+            if hasattr(self, "btn_sf_extract"):
+                self.btn_sf_extract.pack(fill="x", padx=5, pady=(4, 2))
+            if hasattr(self, "btn_sf_sharpen"):
+                self.btn_sf_sharpen.pack(fill="x", padx=5, pady=(4, 2))
+            if hasattr(self, "adv_toggle_btn"):
+                self.adv_toggle_btn.config(state="disabled")
+            self._set_widget_tree_state(self.adv_content_frame, "disabled")
+            self.toggle_sharp_frame_options()
+            return
+
+        # ── Restore widgets hidden by Sharp Frame Only mode ──────────────────
+        if hasattr(self, "sf_enable_cb"):
+            self.sf_enable_cb.config(state="normal")
+        # Restore XML, PLY, Output rows
+        for w in (getattr(self, "paths_xml_widgets", []) +
+                  getattr(self, "paths_ply_widgets", []) +
+                  getattr(self, "paths_out_widgets", [])):
+            w.grid()
+        # Restore the options notebook right after paths_frame
+        if not self.options_notebook.winfo_ismapped():
+            self.options_notebook.pack(fill="x", padx=10, pady=5, after=self.paths_frame)
+        # Restore section titles
+        if hasattr(self, "vid_lf"):
+            self.vid_lf.config(text=self.t("vid_section"))
+        if hasattr(self, "sf_lf"):
+            self.sf_lf.config(text=self.t("sf_section"))
+        # Hide the per-phase run buttons
+        if hasattr(self, "btn_sf_extract"):
+            self.btn_sf_extract.pack_forget()
+        if hasattr(self, "btn_sf_sharpen"):
+            self.btn_sf_sharpen.pack_forget()
+        # Hide video extraction and sharp-frame sections in COLMAP/LFS modes
+        if hasattr(self, "vid_lf") and self.vid_lf.winfo_ismapped():
+            self.vid_lf.pack_forget()
+        if hasattr(self, "sf_lf") and self.sf_lf.winfo_ismapped():
+            self.sf_lf.pack_forget()
+        if hasattr(self, "adv_toggle_btn"):
+            self.adv_toggle_btn.config(state="normal")
+        self._set_widget_tree_state(self.adv_content_frame, "normal")
+
+        # Notebook is visible; adjust per-widget state instead.
 
         # Cubemap tab: COLMAP always forces cubemap ON and locks the checkbox.
         if is_colmap:
@@ -1133,6 +1396,29 @@ class Metashape360GUI:
             else:
                 frame.pack_forget()
 
+    def toggle_video_options(self):
+        """Enable/disable the video sub-panel and sync mode visibility."""
+        if not hasattr(self, "vid_inner"):
+            return
+        enabled = self.var_video_enabled.get()
+        state = "normal" if enabled else "disabled"
+        self._set_widget_tree_state(self.vid_inner, state)
+        self.toggle_video_mode()
+
+    def toggle_video_mode(self):
+        """Show the sub-frame matching the selected video extraction mode."""
+        if not hasattr(self, "vid_every_n_frame"):
+            return
+        mode = self.var_video_mode.get()
+        for frame, val in [
+            (self.vid_every_n_frame, "every-n"),
+            (self.vid_fps_frame, "fps"),
+        ]:
+            if val == mode:
+                frame.pack(fill="x")
+            else:
+                frame.pack_forget()
+
     def reset_defaults(self):
         """Reset all settings to defaults."""
         self.var_images.set(DEFAULTS["images"])
@@ -1182,14 +1468,26 @@ class Metashape360GUI:
         self.var_sharp_frame_sensitivity.set(DEFAULTS["sharp_frame_sensitivity"])
         self.var_sharp_frame_output.set(DEFAULTS["sharp_frame_output"])
 
+        self.var_video_enabled.set(DEFAULTS["video_enabled"])
+        self.var_video_path.set(DEFAULTS["video_path"])
+        self.var_video_mode.set(DEFAULTS["video_mode"])
+        self.var_video_every_n.set(DEFAULTS["video_every_n"])
+        self.var_video_fps.set(DEFAULTS["video_fps"])
+        self.var_video_start_time.set(DEFAULTS["video_start_time"])
+        self.var_video_end_time.set(DEFAULTS["video_end_time"])
+        self.var_video_output.set(DEFAULTS["video_output"])
+
         self.toggle_mode_ui()
         
         self.log(f"{self.t('reset_done')}\n")
     
     def build_command(self, images_override=None):
         """Build the command line arguments based on the selected output mode."""
-        if self.var_output_mode.get() == "LFS":
+        mode = self.var_output_mode.get()
+        if mode == "LFS":
             return self._build_lfs_cmd(images_override=images_override)
+        if mode == "SHARP_FRAME":
+            return self._build_sharp_frame_standalone_cmd(images_override=images_override)
         return self._build_colmap_cmd(images_override=images_override)
 
     def _get_base_python_cmd(self, script_name: str) -> list:
@@ -1331,12 +1629,12 @@ class Metashape360GUI:
 
         return cmd
 
-    def _build_sharp_frame_cmd(self) -> tuple:
+    def _build_sharp_frame_cmd(self, images_override=None) -> tuple:
         """Build the sharp-frames CLI command for the pre-filter step.
 
         Returns (cmd_list, output_dir_str).
         """
-        images = self.var_images.get()
+        images = images_override if images_override else self.var_images.get()
         sf_out = self.var_sharp_frame_output.get().strip()
         if not sf_out:
             images_path = Path(images)
@@ -1373,6 +1671,126 @@ class Metashape360GUI:
 
         return cmd, sf_out
 
+    def _build_sharp_frame_standalone_cmd(self, images_override=None) -> list:
+        """Build the sharp-frames CLI command for Sharp Frame Only mode.
+
+        Uses the output folder (var_output) as the destination.
+        If the output folder is empty, auto-derives it from the images folder name.
+        """
+        images = images_override if images_override else self.var_images.get()
+        out = self.var_sharp_frame_output.get().strip()
+        if not out:
+            images_path = Path(images)
+            out = str(images_path.parent / (images_path.name + "_sharp"))
+
+        base = self.get_app_base_dir()
+        sf_exe = base / ".venv" / "Scripts" / "sharp-frames.exe"
+        if not sf_exe.exists():
+            sf_exe = base / ".venv" / "bin" / "sharp-frames"
+        if sf_exe.exists():
+            cmd = [str(sf_exe)]
+        else:
+            # Fallback: run via the venv python as a module.
+            venv_python = base / ".venv" / "Scripts" / "python.exe"
+            if not venv_python.exists():
+                venv_python = base / ".venv" / "bin" / "python"
+            python_exe = str(venv_python) if venv_python.exists() else sys.executable
+            cmd = [python_exe, "-m", "sharp_frames"]
+
+        cmd.extend([images, out, "--force-overwrite"])
+
+        method = self.var_sharp_frame_method.get()
+        cmd.extend(["--selection-method", method])
+
+        if method == "best-n":
+            cmd.extend(["--num-frames", str(self.var_sharp_frame_num_frames.get())])
+            cmd.extend(["--min-buffer", str(self.var_sharp_frame_min_buffer.get())])
+        elif method == "batched":
+            cmd.extend(["--batch-size", str(self.var_sharp_frame_batch_size.get())])
+            cmd.extend(["--batch-buffer", str(self.var_sharp_frame_batch_buffer.get())])
+        else:
+            cmd.extend(["--outlier-window-size", str(self.var_sharp_frame_window_size.get())])
+            cmd.extend(["--outlier-sensitivity", str(self.var_sharp_frame_sensitivity.get())])
+
+        return cmd
+
+    def _run_video_extraction(self) -> str:
+        """Extract frames from a video file using cv2.
+
+        Streams progress to the output queue.
+        Returns the path to the folder containing extracted frames.
+        """
+        import cv2 as _cv2
+
+        video_path = self.var_video_path.get().strip()
+        vid_out = self.var_video_output.get().strip()
+        if not vid_out:
+            vid_out = str(Path(video_path).parent / (Path(video_path).stem + "_frames"))
+
+        out_dir = Path(vid_out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cap = _cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+
+        total_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+        native_fps = cap.get(_cv2.CAP_PROP_FPS) or 30.0
+        duration = total_frames / native_fps
+
+        self.output_queue.put(
+            f"  File: {Path(video_path).name}\n"
+            f"  Duration: {duration:.1f}s  |  Total frames: {total_frames}"
+            f"  |  Native FPS: {native_fps:.3f}\n"
+            f"  Output: {vid_out}\n\n"
+        )
+
+        start_t = self.var_video_start_time.get()
+        end_t = self.var_video_end_time.get()
+        start_frame = max(0, int(round(start_t * native_fps)))
+        end_frame = min(
+            total_frames,
+            int(round(end_t * native_fps)) if end_t > 0 else total_frames,
+        )
+
+        mode = self.var_video_mode.get()
+        if mode == "every-n":
+            step = max(1, self.var_video_every_n.get())
+            frames_to_extract = set(range(start_frame, end_frame, step))
+        else:  # fps
+            target_fps = max(0.001, self.var_video_fps.get())
+            interval = max(1, round(native_fps / target_fps))
+            frames_to_extract = set(range(start_frame, end_frame, interval))
+
+        total_selected = len(frames_to_extract)
+        self.output_queue.put(f"  Extracting {total_selected} frames...\n")
+
+        n_digits = len(str(total_selected))
+        if start_frame > 0:
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        current_pos = start_frame
+        extracted = 0
+        while current_pos < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if current_pos in frames_to_extract:
+                extracted += 1
+                fname = out_dir / f"frame_{extracted:0{n_digits}d}.jpg"
+                _cv2.imwrite(str(fname), frame, [_cv2.IMWRITE_JPEG_QUALITY, 95])
+                if extracted % 100 == 0:
+                    self.output_queue.put(
+                        f"  Progress: {extracted}/{total_selected} frames extracted\n"
+                    )
+            current_pos += 1
+
+        cap.release()
+        self.output_queue.put(
+            f"  Done: {extracted} frames saved to:\n  {vid_out}\n\n"
+        )
+        return vid_out
+
     def get_app_base_dir(self):
         """Return directory that contains app runtime files.
 
@@ -1386,23 +1804,33 @@ class Metashape360GUI:
     def validate_inputs(self):
         """Validate required inputs before running."""
         errors = []
-        
-        if not self.var_images.get().strip():
-            errors.append(self.t("err_images_required"))
-        elif not Path(self.var_images.get()).exists():
-            errors.append(self.t("err_images_missing", path=self.var_images.get()))
-        
-        if not self.var_xml.get().strip():
-            errors.append(self.t("err_xml_required"))
-        elif not Path(self.var_xml.get()).exists():
-            errors.append(self.t("err_xml_missing", path=self.var_xml.get()))
-        
-        if not self.var_output.get().strip():
+
+        video_active = self.var_video_enabled.get()
+        if video_active:
+            if not self.var_video_path.get().strip():
+                errors.append(self.t("err_video_required"))
+            elif not Path(self.var_video_path.get()).exists():
+                errors.append(self.t("err_video_missing", path=self.var_video_path.get()))
+        else:
+            if not self.var_images.get().strip():
+                errors.append(self.t("err_images_required"))
+            elif not Path(self.var_images.get()).exists():
+                errors.append(self.t("err_images_missing", path=self.var_images.get()))
+
+        is_sharp_only = self.var_output_mode.get() == "SHARP_FRAME"
+
+        if not is_sharp_only:
+            if not self.var_xml.get().strip():
+                errors.append(self.t("err_xml_required"))
+            elif not Path(self.var_xml.get()).exists():
+                errors.append(self.t("err_xml_missing", path=self.var_xml.get()))
+
+        if not is_sharp_only and not self.var_output.get().strip():
             errors.append(self.t("err_output_required"))
-        
-        if self.var_ply.get().strip() and not Path(self.var_ply.get()).exists():
+
+        if not is_sharp_only and self.var_ply.get().strip() and not Path(self.var_ply.get()).exists():
             errors.append(self.t("err_ply_missing", path=self.var_ply.get()))
-        
+
         if errors:
             messagebox.showerror(self.t("err_title"), "\n".join(errors))
             return False
@@ -1417,6 +1845,107 @@ class Metashape360GUI:
         self.stop_btn.config(state="normal")
         self.progress.start()
         threading.Thread(target=self._run_pipeline, daemon=True).start()
+
+    def run_extract_only(self):
+        """Validate and run only Phase 1: video frame extraction."""
+        if not self.var_video_enabled.get():
+            messagebox.showwarning(
+                self.t("err_title"),
+                "Video extraction is not enabled. Enable it first.",
+            )
+            return
+        if not self.var_video_path.get().strip():
+            messagebox.showerror(self.t("err_title"), self.t("err_video_required"))
+            return
+        if not Path(self.var_video_path.get()).exists():
+            messagebox.showerror(
+                self.t("err_title"),
+                self.t("err_video_missing", path=self.var_video_path.get()),
+            )
+            return
+
+        self.run_btn.config(state="disabled")
+        if hasattr(self, "btn_sf_extract"):
+            self.btn_sf_extract.config(state="disabled")
+        if hasattr(self, "btn_sf_sharpen"):
+            self.btn_sf_sharpen.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.progress.start()
+        threading.Thread(target=self._run_extract_only_task, daemon=True).start()
+
+    def _run_extract_only_task(self):
+        """Background thread for Phase 1 (frame extraction only)."""
+        sep = "=" * 50
+        try:
+            self.output_queue.put(f"{sep}\n[\u2460 Phase 1] Video Frame Extraction\n{sep}\n\n")
+            result_dir = self._run_video_extraction()
+            self.output_queue.put(
+                f"\nExtraction complete.\nFrames saved to: {result_dir}\n{sep}\n"
+            )
+        except Exception as e:
+            self.output_queue.put(f"Error during frame extraction: {e}\n")
+        finally:
+            self.output_queue.put("__DONE__")
+
+    def run_sharpen_only(self):
+        """Validate and run only Phase 2: sharp frame selection."""
+        # Source images: either the video output folder or the explicit images folder
+        if self.var_video_enabled.get():
+            vid_out = self.var_video_output.get().strip()
+            if not vid_out and self.var_video_path.get().strip():
+                vid_out = str(
+                    Path(self.var_video_path.get()).parent
+                    / (Path(self.var_video_path.get()).stem + "_frames")
+                )
+            if not vid_out or not Path(vid_out).exists():
+                messagebox.showerror(
+                    self.t("err_title"),
+                    f"Video output folder not found:\n{vid_out}\n\nRun Phase 1 first.",
+                )
+                return
+            images_override = vid_out
+        else:
+            if not self.var_images.get().strip():
+                messagebox.showerror(self.t("err_title"), self.t("err_images_required"))
+                return
+            if not Path(self.var_images.get()).exists():
+                messagebox.showerror(
+                    self.t("err_title"),
+                    self.t("err_images_missing", path=self.var_images.get()),
+                )
+                return
+            images_override = None
+
+        self.run_btn.config(state="disabled")
+        if hasattr(self, "btn_sf_extract"):
+            self.btn_sf_extract.config(state="disabled")
+        if hasattr(self, "btn_sf_sharpen"):
+            self.btn_sf_sharpen.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.progress.start()
+        threading.Thread(
+            target=self._run_sharpen_only_task, args=(images_override,), daemon=True
+        ).start()
+
+    def _run_sharpen_only_task(self, images_override):
+        """Background thread for Phase 2 (sharp frame selection only)."""
+        sep = "=" * 50
+        try:
+            cmd = self._build_sharp_frame_standalone_cmd(images_override=images_override)
+            self.output_queue.put(
+                f"{sep}\n[\u2461 Phase 2] Sharp Frame Selection\n{sep}\n"
+                f"{self.t('cmd', cmd=' '.join(cmd))}\n\n"
+            )
+            rc = self._run_subprocess(cmd)
+            self.output_queue.put(f"\n{sep}\n")
+            if rc == 0:
+                self.output_queue.put("Sharp frame selection complete.\n")
+            else:
+                self.output_queue.put(f"Sharp frame selection failed (exit code {rc}).\n")
+        except Exception as e:
+            self.output_queue.put(f"Error during sharp frame selection: {e}\n")
+        finally:
+            self.output_queue.put("__DONE__")
 
     def _run_subprocess(self, cmd) -> int:
         """Launch a subprocess, stream its stdout to the output queue, and return the exit code."""
@@ -1455,15 +1984,37 @@ class Metashape360GUI:
         return self.process.returncode
 
     def _run_pipeline(self):
-        """Background thread: run optional sharp frame step, then the main conversion."""
+        """Background thread: video extraction → sharp frame → main conversion."""
         try:
             images_override = None
+            sep = "=" * 50
 
-            if self.var_sharp_frame_enabled.get():
-                sf_cmd, sf_out = self._build_sharp_frame_cmd()
-                sep = "=" * 50
+            video_active = self.var_video_enabled.get()
+            is_sharp_only = self.var_output_mode.get() == "SHARP_FRAME"
+            # In SHARP_FRAME mode the sharp-frame step IS the main step,
+            # so skip it as a pre-filter to avoid running it twice.
+            sf_active = self.var_sharp_frame_enabled.get() and not is_sharp_only
+            total_steps = int(video_active) + int(sf_active) + 1
+            current_step = 1
+
+            # Step: Video frame extraction
+            if video_active:
                 self.output_queue.put(
-                    f"[Step 1/2] Sharp frame extraction\n"
+                    f"[Step {current_step}/{total_steps}] Video frame extraction\n\n"
+                )
+                try:
+                    images_override = self._run_video_extraction()
+                except Exception as e:
+                    self.output_queue.put(f"Video extraction failed: {e}\n")
+                    return
+                self.output_queue.put(f"{sep}\n")
+                current_step += 1
+
+            # Step: Sharp frame pre-filter
+            if sf_active:
+                sf_cmd, sf_out = self._build_sharp_frame_cmd(images_override=images_override)
+                self.output_queue.put(
+                    f"[Step {current_step}/{total_steps}] Sharp frame extraction\n"
                     f"{self.t('cmd', cmd=' '.join(sf_cmd))}\n\n"
                 )
                 rc = self._run_subprocess(sf_cmd)
@@ -1475,8 +2026,9 @@ class Metashape360GUI:
                     return
                 self.output_queue.put("Sharp frame extraction completed.\n\n")
                 images_override = sf_out
+                current_step += 1
 
-            step_prefix = "[Step 2/2] " if self.var_sharp_frame_enabled.get() else ""
+            # Step: Main conversion
             try:
                 main_cmd = self.build_command(images_override=images_override)
             except Exception as e:
@@ -1484,10 +2036,10 @@ class Metashape360GUI:
                 return
 
             self.output_queue.put(
-                f"{step_prefix}{self.t('cmd', cmd=' '.join(main_cmd))}\n\n"
+                f"[Step {current_step}/{total_steps}] {self.t('cmd', cmd=' '.join(main_cmd))}\n\n"
             )
             rc = self._run_subprocess(main_cmd)
-            self.output_queue.put(f"\n{'='*50}\n")
+            self.output_queue.put(f"\n{sep}\n")
             if rc == 0:
                 self.output_queue.put(f"{self.t('done_ok')}\n")
             else:
@@ -1593,6 +2145,12 @@ class Metashape360GUI:
                     self.stop_btn.config(state="disabled")
                     self.progress.stop()
                     self.process = None
+                    # Re-enable per-phase SF buttons if they exist
+                    for btn in ("btn_sf_extract", "btn_sf_sharpen"):
+                        try:
+                            getattr(self, btn).config(state="normal")
+                        except (AttributeError, tk.TclError):
+                            pass
                 else:
                     self.log(msg)
         except queue.Empty:
@@ -1681,6 +2239,15 @@ class Metashape360GUI:
             f"sharp-frame-window-size={self.var_sharp_frame_window_size.get()}",
             f"sharp-frame-sensitivity={self.var_sharp_frame_sensitivity.get()}",
             f"sharp-frame-output={self.var_sharp_frame_output.get()}",
+            "",
+            f"video-enabled={self.var_video_enabled.get()}",
+            f"video-path={q(self.var_video_path.get())}",
+            f"video-mode={self.var_video_mode.get()}",
+            f"video-every-n={self.var_video_every_n.get()}",
+            f"video-fps={self.var_video_fps.get()}",
+            f"video-start-time={self.var_video_start_time.get()}",
+            f"video-end-time={self.var_video_end_time.get()}",
+            f"video-output={q(self.var_video_output.get())}",
         ])
         
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1805,7 +2372,7 @@ class Metashape360GUI:
             self.var_apply_component.set(parse_bool(config["apply-component-transform-for-ply"]))
         if "quiet" in config:
             self.var_quiet.set(parse_bool(config["quiet"]))
-        if "output-mode" in config and config["output-mode"] in ("COLMAP", "LFS"):
+        if "output-mode" in config and config["output-mode"] in ("COLMAP", "LFS", "SHARP_FRAME"):
             self.var_output_mode.set(config["output-mode"])
         if "language" in config and config["language"] in UI_TEXT:
             self.var_language.set(config["language"])
@@ -1828,6 +2395,23 @@ class Metashape360GUI:
             self.var_sharp_frame_sensitivity.set(int(config["sharp-frame-sensitivity"]))
         if "sharp-frame-output" in config:
             self.var_sharp_frame_output.set(config["sharp-frame-output"])
+
+        if "video-enabled" in config:
+            self.var_video_enabled.set(parse_bool(config["video-enabled"]))
+        if "video-path" in config:
+            self.var_video_path.set(config["video-path"])
+        if "video-mode" in config and config["video-mode"] in ("every-n", "fps"):
+            self.var_video_mode.set(config["video-mode"])
+        if "video-every-n" in config:
+            self.var_video_every_n.set(int(config["video-every-n"]))
+        if "video-fps" in config:
+            self.var_video_fps.set(float(config["video-fps"]))
+        if "video-start-time" in config:
+            self.var_video_start_time.set(float(config["video-start-time"]))
+        if "video-end-time" in config:
+            self.var_video_end_time.set(float(config["video-end-time"]))
+        if "video-output" in config:
+            self.var_video_output.set(config["video-output"])
 
         self.toggle_mode_ui()
 
