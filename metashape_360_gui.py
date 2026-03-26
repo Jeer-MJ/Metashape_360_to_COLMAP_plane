@@ -52,6 +52,15 @@ DEFAULTS = {
     "lfs_split_cubemap": False,
     "enable_cubemap": True,
     "language": "EN",
+    "sharp_frame_enabled": False,
+    "sharp_frame_method": "best-n",
+    "sharp_frame_num_frames": 300,
+    "sharp_frame_min_buffer": 3,
+    "sharp_frame_batch_size": 5,
+    "sharp_frame_batch_buffer": 2,
+    "sharp_frame_window_size": 15,
+    "sharp_frame_sensitivity": 50,
+    "sharp_frame_output": "",
 }
 
 VALID_DIRECTIONS = ["top", "front", "right", "back", "left", "bottom"]
@@ -165,6 +174,24 @@ UI_TEXT = {
         "tip_enable_cubemap": "Split equirectangular images into 6 perspective (PINHOLE) crops. Always active in COLMAP mode; optional in LFS mode.",
         "lfs_mask_note": "Mask generation is not supported in LFS mode.",
         "skip_inline": "Skip directions:",
+        "sf_section": "Sharp Frame Pre-filter",
+        "sf_enable": "Enable sharp frame extraction before conversion",
+        "sf_method_label": "Method:",
+        "sf_method_best_n": "best-n (target count)",
+        "sf_method_batched": "batched (window blocks)",
+        "sf_method_outlier": "outlier-removal (remove blurry)",
+        "sf_num_frames": "Target frames:",
+        "sf_min_buffer": "Min buffer:",
+        "sf_batch_size": "Batch size:",
+        "sf_batch_buffer": "Batch buffer:",
+        "sf_window_size": "Window size:",
+        "sf_sensitivity": "Sensitivity (0-100):",
+        "sf_output": "Output folder (empty = auto):",
+        "tip_sf_enable": "Run sharp-frames (Reflct) to select only the sharpest images from the input folder before conversion. Requires: pip install sharp-frames",
+        "tip_sf_num_frames": "Target number of sharpest frames to select (best-n method)",
+        "tip_sf_sensitivity": "0 = keep more frames, 100 = remove aggressively (outlier-removal method)",
+        "tip_sf_output": "Folder where selected sharp frames are written. Leave empty to auto-derive as <images_folder>_sharp/",
+        "sf_note": "Requires: pip install sharp-frames",
     },
     "JP": {
         "app_title": "Metashape 360° to COLMAP コンバーター",
@@ -267,6 +294,24 @@ UI_TEXT = {
         "tip_enable_cubemap": "Equirectangular画像を6面のPINHOLEクロップに分割します。COLMAPモードでは常に有効；LFSモードでは任意。",
         "lfs_mask_note": "マスク生成はLFSモードでは使用できません。",
         "skip_inline": "スキップ方向:",
+        "sf_section": "シャープフレーム前処理",
+        "sf_enable": "変換前にシャープフレーム抽出を有効化",
+        "sf_method_label": "手法:",
+        "sf_method_best_n": "best-n (目標フレーム数)",
+        "sf_method_batched": "batched (ウィンドウブロック)",
+        "sf_method_outlier": "outlier-removal (ブレフレーム除去)",
+        "sf_num_frames": "目標フレーム数:",
+        "sf_min_buffer": "最小バッファ:",
+        "sf_batch_size": "バッチサイズ:",
+        "sf_batch_buffer": "バッチバッファ:",
+        "sf_window_size": "ウィンドウサイズ:",
+        "sf_sensitivity": "感度 (0-100):",
+        "sf_output": "出力フォルダ (空=自動):",
+        "tip_sf_enable": "変換前にsharp-frames (Reflct)を使用して最もシャープな画像を選択します。要件: pip install sharp-frames",
+        "tip_sf_num_frames": "選択するシャープフレームの目標数 (best-n手法)",
+        "tip_sf_sensitivity": "0=多めに保持、100=積極的に除去 (outlier-removal手法)",
+        "tip_sf_output": "選択されたシャープフレームの書き出し先。空の場合は<images_folder>_sharp/に自動設定。",
+        "sf_note": "要件: pip install sharp-frames",
     },
 }
 
@@ -382,6 +427,17 @@ class Metashape360GUI:
         self.var_output_mode = tk.StringVar(value=DEFAULTS["output_mode"])
         self.var_enable_cubemap = tk.BooleanVar(value=DEFAULTS["enable_cubemap"])
 
+        # Sharp frame pre-filter
+        self.var_sharp_frame_enabled = tk.BooleanVar(value=DEFAULTS["sharp_frame_enabled"])
+        self.var_sharp_frame_method = tk.StringVar(value=DEFAULTS["sharp_frame_method"])
+        self.var_sharp_frame_num_frames = tk.IntVar(value=DEFAULTS["sharp_frame_num_frames"])
+        self.var_sharp_frame_min_buffer = tk.IntVar(value=DEFAULTS["sharp_frame_min_buffer"])
+        self.var_sharp_frame_batch_size = tk.IntVar(value=DEFAULTS["sharp_frame_batch_size"])
+        self.var_sharp_frame_batch_buffer = tk.IntVar(value=DEFAULTS["sharp_frame_batch_buffer"])
+        self.var_sharp_frame_window_size = tk.IntVar(value=DEFAULTS["sharp_frame_window_size"])
+        self.var_sharp_frame_sensitivity = tk.IntVar(value=DEFAULTS["sharp_frame_sensitivity"])
+        self.var_sharp_frame_output = tk.StringVar(value=DEFAULTS["sharp_frame_output"])
+
     def t(self, key, **kwargs):
         """Get localized UI text."""
         lang = self.var_language.get() if hasattr(self, "var_language") else "EN"
@@ -472,7 +528,106 @@ class Metashape360GUI:
         )
         rb_lfs.pack(side="left", padx=10)
         ToolTip(rb_lfs, self.t("tip_mode"))
-        
+
+        # ===== Sharp Frame Pre-filter Section =====
+        sf_lf = ttk.LabelFrame(scrollable_frame, text=self.t("sf_section"), padding=8)
+        sf_lf.pack(fill="x", padx=padx, pady=(0, pady))
+
+        sf_top_row = ttk.Frame(sf_lf)
+        sf_top_row.pack(fill="x")
+
+        sf_enable_cb = ttk.Checkbutton(
+            sf_top_row,
+            text=self.t("sf_enable"),
+            variable=self.var_sharp_frame_enabled,
+            command=self.toggle_sharp_frame_options,
+        )
+        sf_enable_cb.pack(side="left", padx=5, pady=(2, 4))
+        ToolTip(sf_enable_cb, self.t("tip_sf_enable"))
+
+        ttk.Label(sf_top_row, text=self.t("sf_note"), foreground="gray").pack(
+            side="right", padx=10
+        )
+
+        self.sf_inner = ttk.Frame(sf_lf)
+        self.sf_inner.pack(fill="x", padx=5, pady=(0, 4))
+
+        # Method selector row
+        method_row = ttk.Frame(self.sf_inner)
+        method_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(method_row, text=self.t("sf_method_label")).pack(side="left", padx=(0, 8))
+        for val, key in [
+            ("best-n", "sf_method_best_n"),
+            ("batched", "sf_method_batched"),
+            ("outlier-removal", "sf_method_outlier"),
+        ]:
+            ttk.Radiobutton(
+                method_row,
+                text=self.t(key),
+                variable=self.var_sharp_frame_method,
+                value=val,
+                command=self.toggle_sharp_frame_method,
+            ).pack(side="left", padx=6)
+
+        # Method sub-option container — only one sub-frame visible at a time
+        self.sf_subopts_container = ttk.Frame(self.sf_inner)
+        self.sf_subopts_container.pack(fill="x", pady=(0, 4))
+
+        self.sf_best_n_frame = ttk.Frame(self.sf_subopts_container)
+        ttk.Label(self.sf_best_n_frame, text=self.t("sf_num_frames")).pack(side="left", padx=5)
+        sf_num_frames_spin = ttk.Spinbox(
+            self.sf_best_n_frame, from_=10, to=10000, increment=50,
+            textvariable=self.var_sharp_frame_num_frames, width=8,
+        )
+        sf_num_frames_spin.pack(side="left", padx=5)
+        ToolTip(sf_num_frames_spin, self.t("tip_sf_num_frames"))
+        ttk.Label(self.sf_best_n_frame, text=self.t("sf_min_buffer")).pack(side="left", padx=(12, 5))
+        ttk.Spinbox(
+            self.sf_best_n_frame, from_=1, to=50,
+            textvariable=self.var_sharp_frame_min_buffer, width=6,
+        ).pack(side="left", padx=5)
+
+        self.sf_batched_frame = ttk.Frame(self.sf_subopts_container)
+        ttk.Label(self.sf_batched_frame, text=self.t("sf_batch_size")).pack(side="left", padx=5)
+        ttk.Spinbox(
+            self.sf_batched_frame, from_=2, to=100,
+            textvariable=self.var_sharp_frame_batch_size, width=6,
+        ).pack(side="left", padx=5)
+        ttk.Label(self.sf_batched_frame, text=self.t("sf_batch_buffer")).pack(side="left", padx=(12, 5))
+        ttk.Spinbox(
+            self.sf_batched_frame, from_=0, to=20,
+            textvariable=self.var_sharp_frame_batch_buffer, width=6,
+        ).pack(side="left", padx=5)
+
+        self.sf_outlier_frame = ttk.Frame(self.sf_subopts_container)
+        ttk.Label(self.sf_outlier_frame, text=self.t("sf_window_size")).pack(side="left", padx=5)
+        ttk.Spinbox(
+            self.sf_outlier_frame, from_=3, to=100,
+            textvariable=self.var_sharp_frame_window_size, width=6,
+        ).pack(side="left", padx=5)
+        ttk.Label(self.sf_outlier_frame, text=self.t("sf_sensitivity")).pack(side="left", padx=(12, 5))
+        sf_sens_spin = ttk.Spinbox(
+            self.sf_outlier_frame, from_=0, to=100,
+            textvariable=self.var_sharp_frame_sensitivity, width=6,
+        )
+        sf_sens_spin.pack(side="left", padx=5)
+        ToolTip(sf_sens_spin, self.t("tip_sf_sensitivity"))
+
+        # Output folder row
+        sf_out_row = ttk.Frame(self.sf_inner)
+        sf_out_row.pack(fill="x")
+        ttk.Label(sf_out_row, text=self.t("sf_output")).pack(side="left", padx=5)
+        self.sf_output_entry = ttk.Entry(sf_out_row, textvariable=self.var_sharp_frame_output, width=42)
+        self.sf_output_entry.pack(side="left", padx=5, fill="x", expand=True)
+        ToolTip(self.sf_output_entry, self.t("tip_sf_output"))
+        ttk.Button(
+            sf_out_row, text=self.t("browse"), width=8,
+            command=lambda: self.browse_folder(self.var_sharp_frame_output),
+        ).pack(side="left", padx=5)
+
+        self.toggle_sharp_frame_method()
+        self.toggle_sharp_frame_options()
+
         # ===== File Paths Section =====
         paths_frame = ttk.LabelFrame(scrollable_frame, text=self.t("paths_section"), padding=10)
         paths_frame.pack(fill="x", padx=padx, pady=pady)
@@ -943,7 +1098,41 @@ class Metashape360GUI:
 
         # Sync cubemap inner controls.
         self.toggle_cubemap_options()
+        self.toggle_sharp_frame_options()
     
+    def _set_widget_tree_state(self, widget, state):
+        """Recursively set the state on a widget and all its descendants."""
+        try:
+            widget.config(state=state)
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            self._set_widget_tree_state(child, state)
+
+    def toggle_sharp_frame_options(self):
+        """Enable/disable the sharp frame sub-panel and sync method visibility."""
+        if not hasattr(self, "sf_inner"):
+            return
+        enabled = self.var_sharp_frame_enabled.get()
+        state = "normal" if enabled else "disabled"
+        self._set_widget_tree_state(self.sf_inner, state)
+        self.toggle_sharp_frame_method()
+
+    def toggle_sharp_frame_method(self):
+        """Show the sub-frame matching the selected method; hide the others."""
+        if not hasattr(self, "sf_best_n_frame"):
+            return
+        method = self.var_sharp_frame_method.get()
+        for frame, val in [
+            (self.sf_best_n_frame, "best-n"),
+            (self.sf_batched_frame, "batched"),
+            (self.sf_outlier_frame, "outlier-removal"),
+        ]:
+            if val == method:
+                frame.pack(fill="x")
+            else:
+                frame.pack_forget()
+
     def reset_defaults(self):
         """Reset all settings to defaults."""
         self.var_images.set(DEFAULTS["images"])
@@ -983,15 +1172,25 @@ class Metashape360GUI:
         for d in VALID_DIRECTIONS:
             self.var_skip_directions[d].set(False)
 
+        self.var_sharp_frame_enabled.set(DEFAULTS["sharp_frame_enabled"])
+        self.var_sharp_frame_method.set(DEFAULTS["sharp_frame_method"])
+        self.var_sharp_frame_num_frames.set(DEFAULTS["sharp_frame_num_frames"])
+        self.var_sharp_frame_min_buffer.set(DEFAULTS["sharp_frame_min_buffer"])
+        self.var_sharp_frame_batch_size.set(DEFAULTS["sharp_frame_batch_size"])
+        self.var_sharp_frame_batch_buffer.set(DEFAULTS["sharp_frame_batch_buffer"])
+        self.var_sharp_frame_window_size.set(DEFAULTS["sharp_frame_window_size"])
+        self.var_sharp_frame_sensitivity.set(DEFAULTS["sharp_frame_sensitivity"])
+        self.var_sharp_frame_output.set(DEFAULTS["sharp_frame_output"])
+
         self.toggle_mode_ui()
         
         self.log(f"{self.t('reset_done')}\n")
     
-    def build_command(self):
+    def build_command(self, images_override=None):
         """Build the command line arguments based on the selected output mode."""
         if self.var_output_mode.get() == "LFS":
-            return self._build_lfs_cmd()
-        return self._build_colmap_cmd()
+            return self._build_lfs_cmd(images_override=images_override)
+        return self._build_colmap_cmd(images_override=images_override)
 
     def _get_base_python_cmd(self, script_name: str) -> list:
         """Return the base interpreter + script invocation for a given script name."""
@@ -1010,11 +1209,12 @@ class Metashape360GUI:
         python_exe = str(venv_python) if venv_python.exists() else sys.executable
         return [python_exe, "-u", str(script_path)]
 
-    def _build_colmap_cmd(self) -> list:
+    def _build_colmap_cmd(self, images_override=None) -> list:
         """Build command arguments for metashape_360_to_colmap.py."""
         cmd = self._get_base_python_cmd("metashape_360_to_colmap.py")
 
-        cmd.extend(["--images", self.var_images.get()])
+        images = images_override if images_override else self.var_images.get()
+        cmd.extend(["--images", images])
         cmd.extend(["--xml", self.var_xml.get()])
         cmd.extend(["--output", self.var_output.get()])
 
@@ -1073,11 +1273,12 @@ class Metashape360GUI:
 
         return cmd
 
-    def _build_lfs_cmd(self) -> list:
+    def _build_lfs_cmd(self, images_override=None) -> list:
         """Build command arguments for metashape_360_lfs.py."""
         cmd = self._get_base_python_cmd("metashape_360_lfs.py")
 
-        cmd.extend(["--images", self.var_images.get()])
+        images = images_override if images_override else self.var_images.get()
+        cmd.extend(["--images", images])
         cmd.extend(["--xml", self.var_xml.get()])
         cmd.extend(["--output", self.var_output.get()])
 
@@ -1130,6 +1331,48 @@ class Metashape360GUI:
 
         return cmd
 
+    def _build_sharp_frame_cmd(self) -> tuple:
+        """Build the sharp-frames CLI command for the pre-filter step.
+
+        Returns (cmd_list, output_dir_str).
+        """
+        images = self.var_images.get()
+        sf_out = self.var_sharp_frame_output.get().strip()
+        if not sf_out:
+            images_path = Path(images)
+            sf_out = str(images_path.parent / (images_path.name + "_sharp"))
+
+        base = self.get_app_base_dir()
+        sf_exe = base / ".venv" / "Scripts" / "sharp-frames.exe"
+        if not sf_exe.exists():
+            sf_exe = base / ".venv" / "bin" / "sharp-frames"
+        if sf_exe.exists():
+            cmd = [str(sf_exe)]
+        else:
+            # Fallback: run via the venv python as a module (some install layouts)
+            venv_python = base / ".venv" / "Scripts" / "python.exe"
+            if not venv_python.exists():
+                venv_python = base / ".venv" / "bin" / "python"
+            python_exe = str(venv_python) if venv_python.exists() else sys.executable
+            cmd = [python_exe, "-m", "sharp_frames"]
+
+        cmd.extend([images, sf_out, "--force-overwrite"])
+
+        method = self.var_sharp_frame_method.get()
+        cmd.extend(["--selection-method", method])
+
+        if method == "best-n":
+            cmd.extend(["--num-frames", str(self.var_sharp_frame_num_frames.get())])
+            cmd.extend(["--min-buffer", str(self.var_sharp_frame_min_buffer.get())])
+        elif method == "batched":
+            cmd.extend(["--batch-size", str(self.var_sharp_frame_batch_size.get())])
+            cmd.extend(["--batch-buffer", str(self.var_sharp_frame_batch_buffer.get())])
+        else:
+            cmd.extend(["--outlier-window-size", str(self.var_sharp_frame_window_size.get())])
+            cmd.extend(["--outlier-sensitivity", str(self.var_sharp_frame_sensitivity.get())])
+
+        return cmd, sf_out
+
     def get_app_base_dir(self):
         """Return directory that contains app runtime files.
 
@@ -1166,75 +1409,94 @@ class Metashape360GUI:
         return True
     
     def run_conversion(self):
-        """Run the conversion process."""
+        """Validate inputs and start the conversion pipeline in a background thread."""
         if not self.validate_inputs():
             return
 
-        try:
-            cmd = self.build_command()
-        except Exception as e:
-            messagebox.showerror(self.t("err_title"), str(e))
-            self.log(f"{self.t('error', error=e)}\n")
-            return
-
-        self.log(f"{self.t('cmd', cmd=' '.join(cmd))}\n\n")
-        
-        # Disable run button, enable stop
         self.run_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.progress.start()
-        
-        # Run in background thread
-        def run_process():
-            try:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    universal_newlines=True,
-                    cwd=str(self.get_app_base_dir()),
-                    env=self.get_subprocess_env(),
-                    creationflags=self.get_subprocess_creationflags(),
+        threading.Thread(target=self._run_pipeline, daemon=True).start()
+
+    def _run_subprocess(self, cmd) -> int:
+        """Launch a subprocess, stream its stdout to the output queue, and return the exit code."""
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            universal_newlines=True,
+            cwd=str(self.get_app_base_dir()),
+            env=self.get_subprocess_env(),
+            creationflags=self.get_subprocess_creationflags(),
+        )
+
+        line_buf = ""
+        while True:
+            ch = self.process.stdout.read(1)
+            if ch == "":
+                if line_buf:
+                    self.output_queue.put(line_buf + "\n")
+                    line_buf = ""
+                if self.process.poll() is not None:
+                    break
+                continue
+            if ch in ("\n", "\r"):
+                if line_buf:
+                    self.output_queue.put(line_buf + "\n")
+                    line_buf = ""
+                continue
+            line_buf += ch
+
+        self.process.wait()
+        return self.process.returncode
+
+    def _run_pipeline(self):
+        """Background thread: run optional sharp frame step, then the main conversion."""
+        try:
+            images_override = None
+
+            if self.var_sharp_frame_enabled.get():
+                sf_cmd, sf_out = self._build_sharp_frame_cmd()
+                sep = "=" * 50
+                self.output_queue.put(
+                    f"[Step 1/2] Sharp frame extraction\n"
+                    f"{self.t('cmd', cmd=' '.join(sf_cmd))}\n\n"
                 )
+                rc = self._run_subprocess(sf_cmd)
+                self.output_queue.put(f"\n{sep}\n")
+                if rc != 0:
+                    self.output_queue.put(
+                        f"Sharp frame extraction failed (exit code {rc}).\n"
+                    )
+                    return
+                self.output_queue.put("Sharp frame extraction completed.\n\n")
+                images_override = sf_out
 
-                # Read one character at a time so we can handle both '\n' and
-                # '\r' terminated progress output from the CLI in real time.
-                line_buf = ""
-                while True:
-                    ch = self.process.stdout.read(1)
-                    if ch == "":
-                        if line_buf:
-                            self.output_queue.put(line_buf + "\n")
-                            line_buf = ""
-                        if self.process.poll() is not None:
-                            break
-                        continue
-
-                    if ch in ("\n", "\r"):
-                        if line_buf:
-                            self.output_queue.put(line_buf + "\n")
-                            line_buf = ""
-                        continue
-
-                    line_buf += ch
-                
-                self.process.wait()
-                rc = self.process.returncode
-                self.output_queue.put(f"\n{'='*50}\n")
-                if rc == 0:
-                    self.output_queue.put(f"{self.t('done_ok')}\n")
-                else:
-                    self.output_queue.put(f"{self.t('done_ng', code=rc)}\n")
+            step_prefix = "[Step 2/2] " if self.var_sharp_frame_enabled.get() else ""
+            try:
+                main_cmd = self.build_command(images_override=images_override)
             except Exception as e:
                 self.output_queue.put(f"{self.t('error', error=e)}\n")
-            finally:
-                self.output_queue.put("__DONE__")
-        
-        threading.Thread(target=run_process, daemon=True).start()
+                return
+
+            self.output_queue.put(
+                f"{step_prefix}{self.t('cmd', cmd=' '.join(main_cmd))}\n\n"
+            )
+            rc = self._run_subprocess(main_cmd)
+            self.output_queue.put(f"\n{'='*50}\n")
+            if rc == 0:
+                self.output_queue.put(f"{self.t('done_ok')}\n")
+            else:
+                self.output_queue.put(f"{self.t('done_ng', code=rc)}\n")
+
+        except Exception as e:
+            self.output_queue.put(f"{self.t('error', error=e)}\n")
+        finally:
+            self.output_queue.put("__DONE__")
 
     def get_subprocess_env(self):
         """Return environment for subprocess execution.
@@ -1409,6 +1671,16 @@ class Metashape360GUI:
             f"quiet={self.var_quiet.get()}",
             f"output-mode={self.var_output_mode.get()}",
             f"language={self.var_language.get()}",
+            "",
+            f"sharp-frame-enabled={self.var_sharp_frame_enabled.get()}",
+            f"sharp-frame-method={self.var_sharp_frame_method.get()}",
+            f"sharp-frame-num-frames={self.var_sharp_frame_num_frames.get()}",
+            f"sharp-frame-min-buffer={self.var_sharp_frame_min_buffer.get()}",
+            f"sharp-frame-batch-size={self.var_sharp_frame_batch_size.get()}",
+            f"sharp-frame-batch-buffer={self.var_sharp_frame_batch_buffer.get()}",
+            f"sharp-frame-window-size={self.var_sharp_frame_window_size.get()}",
+            f"sharp-frame-sensitivity={self.var_sharp_frame_sensitivity.get()}",
+            f"sharp-frame-output={self.var_sharp_frame_output.get()}",
         ])
         
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1537,6 +1809,25 @@ class Metashape360GUI:
             self.var_output_mode.set(config["output-mode"])
         if "language" in config and config["language"] in UI_TEXT:
             self.var_language.set(config["language"])
+
+        if "sharp-frame-enabled" in config:
+            self.var_sharp_frame_enabled.set(parse_bool(config["sharp-frame-enabled"]))
+        if "sharp-frame-method" in config and config["sharp-frame-method"] in ("best-n", "batched", "outlier-removal"):
+            self.var_sharp_frame_method.set(config["sharp-frame-method"])
+        if "sharp-frame-num-frames" in config:
+            self.var_sharp_frame_num_frames.set(int(config["sharp-frame-num-frames"]))
+        if "sharp-frame-min-buffer" in config:
+            self.var_sharp_frame_min_buffer.set(int(config["sharp-frame-min-buffer"]))
+        if "sharp-frame-batch-size" in config:
+            self.var_sharp_frame_batch_size.set(int(config["sharp-frame-batch-size"]))
+        if "sharp-frame-batch-buffer" in config:
+            self.var_sharp_frame_batch_buffer.set(int(config["sharp-frame-batch-buffer"]))
+        if "sharp-frame-window-size" in config:
+            self.var_sharp_frame_window_size.set(int(config["sharp-frame-window-size"]))
+        if "sharp-frame-sensitivity" in config:
+            self.var_sharp_frame_sensitivity.set(int(config["sharp-frame-sensitivity"]))
+        if "sharp-frame-output" in config:
+            self.var_sharp_frame_output.set(config["sharp-frame-output"])
 
         self.toggle_mode_ui()
 
