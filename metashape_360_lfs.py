@@ -54,6 +54,74 @@ try:
 except ImportError:
     HAS_YOLO = False
 
+# Native SAM3 predictor (Meta SAM3 model via ultralytics).
+# Supports text-concept segmentation with set_image() + predictor(text=...) API.
+try:
+    from ultralytics.models.sam import SAM3SemanticPredictor as _SAM3SemanticPredictor
+    HAS_SAM3_NATIVE = True
+except ImportError:
+    _SAM3SemanticPredictor = None
+    HAS_SAM3_NATIVE = False
+
+# SAM3 engine is available if either ultralytics YOLOE or the native SAM3 predictor is.
+HAS_SAM3 = HAS_YOLO or HAS_SAM3_NATIVE
+
+
+def _lfs_load_open_vocab_model(
+    model_path: str,
+    conf: float = 0.25,
+    half: bool = False,
+) -> Any:
+    """Load an open-vocabulary segmentation model.
+
+    Tries loaders in this order:
+      1. YOLOE / YOLOWorld / YOLO  — lightweight ultralytics models (~67 MB).
+      2. SAM3SemanticPredictor     — native Meta SAM3 model (~3.3 GB), which
+         uses set_image() + predictor(text=...) inference API.
+
+    The ``conf`` and ``half`` parameters are forwarded to SAM3SemanticPredictor
+    via its ``overrides`` dict (they are ignored for YOLOE-family models where
+    these are set per-inference call instead).
+    """
+    import importlib
+    ul = importlib.import_module("ultralytics")
+    last_exc: Optional[Exception] = None
+
+    # --- Try all YOLOE-family loaders first (fast, ~67 MB models) ---
+    for cls_name in ("YOLOE", "YOLOWorld", "YOLO"):
+        cls = getattr(ul, cls_name, None)
+        if cls is None:
+            continue
+        try:
+            return cls(model_path)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+
+    # --- Fall back to native SAM3SemanticPredictor (Meta SAM3 checkpoint) ---
+    # Meta's SAM3 checkpoint has 'detector'/'tracker' keys that YOLOE cannot
+    # load.  SAM3SemanticPredictor is the correct class for that format.
+    if _SAM3SemanticPredictor is not None:
+        try:
+            import torch
+            overrides = dict(
+                conf=conf,
+                task="segment",
+                mode="predict",
+                model=model_path,
+                half=half and torch.cuda.is_available(),
+                verbose=False,
+                save=False,
+            )
+            return _SAM3SemanticPredictor(overrides=overrides)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+
+    raise RuntimeError(
+        f"Could not load open-vocabulary model '{model_path}'. "
+        f"Last error: {last_exc}. "
+        "Ensure ultralytics>=8.3 is installed: pip install -U ultralytics"
+    )
+
 # ---------------------------------------------------------------------------
 # Cubemap-split helpers (ported from metashape_360_to_colmap.py)
 # ---------------------------------------------------------------------------
@@ -214,7 +282,7 @@ def _lfs_generate_mask(
             if result.masks is not None:
                 for i, cls in enumerate(result.boxes.cls):
                     if int(cls) in target_classes:
-                        mask_data = result.masks.data[i].cpu().numpy()
+                        mask_data = result.masks.data[i].cpu().numpy().astype(np.float32)
                         mask_resized = _cv2.resize(
                             mask_data, (w, h), interpolation=_cv2.INTER_LINEAR
                         )
@@ -232,6 +300,74 @@ def _lfs_generate_mask(
         combined = np.maximum(combined, overexp)
 
     # Invert polarity: default is background=white, masked=black
+    if not invert_mask:
+        combined = 255 - combined
+
+    return _PILImage.fromarray(combined, mode="L")
+
+
+def _lfs_generate_mask_sam3(
+    image: Any,
+    model: Any,
+    concepts: List[str],
+    conf: float = 0.25,
+    invert_mask: bool = False,
+    mask_overexposure: bool = False,
+    overexposure_threshold: int = 250,
+    overexposure_dilate: int = 5,
+) -> Any:
+    """Generate a mask using an open-vocabulary model with text concept prompts.
+
+    Supports two backends:
+      • SAM3SemanticPredictor (native Meta SAM3): uses set_image(bgr_array)
+        followed by predictor(text=concepts).  Confidence is already baked into
+        the predictor's overrides at load time.
+      • YOLOE / YOLOWorld / YOLO: uses set_classes(concepts) + model(image).
+        Falls back to texts= kwarg or plain inference if set_classes is absent.
+
+    Returns:
+        PIL Image (mode "L") with default polarity: 255 = keep, 0 = masked.
+    """
+    h, w = np.array(image).shape[:2]
+    combined = np.zeros((h, w), dtype=np.uint8)
+
+    if _SAM3SemanticPredictor is not None and isinstance(model, _SAM3SemanticPredictor):
+        # Native Meta SAM3: convert PIL → BGR numpy array then run via predictor API.
+        img_bgr = _cv2.cvtColor(np.array(image), _cv2.COLOR_RGB2BGR)
+        model.set_image(img_bgr)
+        results = model(text=concepts)
+    else:
+        # YOLOE-family: set text concepts then run standard ultralytics inference.
+        try:
+            model.set_classes(concepts)
+            results = model(image, verbose=False, conf=conf)
+        except (AttributeError, TypeError):
+            # Model does not support set_classes — try texts= keyword directly.
+            try:
+                results = model(image, texts=concepts, verbose=False, conf=conf)
+            except TypeError:
+                results = model(image, verbose=False, conf=conf)
+
+    for result in results:
+        if result.masks is not None:
+            for mask_data in result.masks.data:
+                mask_np = mask_data.cpu().numpy().astype(np.float32)
+                mask_r = _cv2.resize(mask_np, (w, h), interpolation=_cv2.INTER_LINEAR)
+                combined = np.maximum(combined, (mask_r * 255).astype(np.uint8))
+        elif result.boxes is not None:
+            # No segmentation masks — rasterise bounding boxes as rectangular regions.
+            for bbox in result.boxes.xyxy:
+                x1, y1, x2, y2 = (int(v) for v in bbox.cpu().numpy())
+                combined[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 255
+
+    if mask_overexposure:
+        overexp = _lfs_create_overexposure_mask(
+            image,
+            threshold=overexposure_threshold,
+            dilate_pixels=overexposure_dilate,
+        )
+        combined = np.maximum(combined, overexp)
+
     if not invert_mask:
         combined = 255 - combined
 
@@ -496,6 +632,11 @@ def convert_metashape_to_lichtfeld(
     mask_overexposure: bool = False,
     overexposure_threshold: int = 250,
     overexposure_dilate: int = 5,
+    mask_engine: str = "yolo",
+    sam3_model_path: str = "sam3.pt",
+    sam3_concepts: Optional[List[str]] = None,
+    sam3_conf: float = 0.25,
+    sam3_half: bool = True,
 ) -> Dict[str, Any]:
     """
     Convert Metashape data to LichtFeld-compatible transforms.json format.
@@ -568,15 +709,49 @@ def convert_metashape_to_lichtfeld(
             )
         masks_output_dir.mkdir(parents=True, exist_ok=True)
 
+    sam3_model_instance = None
+
     if generate_masks:
-        if not HAS_YOLO:
-            raise ImportError(
-                "--generate-masks requires ultralytics. "
-                "Install with: pip install ultralytics"
+        if mask_engine == "sam3":
+            if not HAS_SAM3:
+                raise ImportError(
+                    "--mask-engine sam3 requires ultralytics. "
+                    "Install with: pip install ultralytics"
+                )
+            if verbose:
+                print(f"Loading SAM3 model: {sam3_model_path}")
+            sam3_model_instance = _lfs_load_open_vocab_model(
+                sam3_model_path, conf=sam3_conf, half=sam3_half
             )
-        if verbose:
-            print(f"Loading YOLO model: {yolo_model_path}")
-        yolo_model_instance = _YOLO(yolo_model_path)
+            if verbose:
+                is_native = (
+                    _SAM3SemanticPredictor is not None
+                    and isinstance(sam3_model_instance, _SAM3SemanticPredictor)
+                )
+                print(f"  Backend: {'SAM3SemanticPredictor (Meta SAM3)' if is_native else 'YOLOE/YOLOWorld'}")
+            # SAM3SemanticPredictor handles FP16/CUDA via its overrides at init.
+            # For YOLOE-family models, apply FP16 manually after loading.
+            if sam3_half and not (
+                _SAM3SemanticPredictor is not None
+                and isinstance(sam3_model_instance, _SAM3SemanticPredictor)
+            ):
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        sam3_model_instance.to("cuda").half()
+                        if verbose:
+                            print("  SAM3: FP16 enabled on CUDA")
+                except Exception:
+                    pass
+        else:  # "yolo"
+            if not HAS_YOLO:
+                raise ImportError(
+                    "--generate-masks requires ultralytics. "
+                    "Install with: pip install ultralytics"
+                )
+            if verbose:
+                print(f"Loading YOLO model: {yolo_model_path}")
+            yolo_model_instance = _YOLO(yolo_model_path)
 
     if verbose:
         print(f"Parsing Metashape XML: {xml_path}")
@@ -704,16 +879,28 @@ def convert_metashape_to_lichtfeld(
                     mask_name = f"{base_name}_{direction}.png"
                     mask_path_file = masks_output_dir / mask_name
                     if not mask_path_file.exists():
-                        mask_img = _lfs_generate_mask(
-                            cropped,
-                            yolo_model_instance,
-                            yolo_conf=yolo_conf,
-                            invert_mask=invert_mask,
-                            class_ids=yolo_class_ids,
-                            mask_overexposure=mask_overexposure,
-                            overexposure_threshold=overexposure_threshold,
-                            overexposure_dilate=overexposure_dilate,
-                        )
+                        if mask_engine == "sam3":
+                            mask_img = _lfs_generate_mask_sam3(
+                                cropped,
+                                sam3_model_instance,
+                                concepts=sam3_concepts or [],
+                                conf=sam3_conf,
+                                invert_mask=invert_mask,
+                                mask_overexposure=mask_overexposure,
+                                overexposure_threshold=overexposure_threshold,
+                                overexposure_dilate=overexposure_dilate,
+                            )
+                        else:
+                            mask_img = _lfs_generate_mask(
+                                cropped,
+                                yolo_model_instance,
+                                yolo_conf=yolo_conf,
+                                invert_mask=invert_mask,
+                                class_ids=yolo_class_ids,
+                                mask_overexposure=mask_overexposure,
+                                overexposure_threshold=overexposure_threshold,
+                                overexposure_dilate=overexposure_dilate,
+                            )
                         mask_img.save(str(mask_path_file))
                     frame["mask_path"] = f"masks/{mask_name}"
 
@@ -745,16 +932,28 @@ def convert_metashape_to_lichtfeld(
                 mask_path_file = masks_output_dir / mask_name
                 if not mask_path_file.exists():
                     pil_img = _PILImage.open(str(src_image)).convert("RGB")
-                    mask_img = _lfs_generate_mask(
-                        pil_img,
-                        yolo_model_instance,
-                        yolo_conf=yolo_conf,
-                        invert_mask=invert_mask,
-                        class_ids=yolo_class_ids,
-                        mask_overexposure=mask_overexposure,
-                        overexposure_threshold=overexposure_threshold,
-                        overexposure_dilate=overexposure_dilate,
-                    )
+                    if mask_engine == "sam3":
+                        mask_img = _lfs_generate_mask_sam3(
+                            pil_img,
+                            sam3_model_instance,
+                            concepts=sam3_concepts or [],
+                            conf=sam3_conf,
+                            invert_mask=invert_mask,
+                            mask_overexposure=mask_overexposure,
+                            overexposure_threshold=overexposure_threshold,
+                            overexposure_dilate=overexposure_dilate,
+                        )
+                    else:
+                        mask_img = _lfs_generate_mask(
+                            pil_img,
+                            yolo_model_instance,
+                            yolo_conf=yolo_conf,
+                            invert_mask=invert_mask,
+                            class_ids=yolo_class_ids,
+                            mask_overexposure=mask_overexposure,
+                            overexposure_threshold=overexposure_threshold,
+                            overexposure_dilate=overexposure_dilate,
+                        )
                     mask_img.save(str(mask_path_file))
                 frame["mask_path"] = f"masks/{mask_name}"
 
@@ -876,6 +1075,170 @@ def convert_metashape_to_lichtfeld(
     }
 
 
+def run_mask_only(
+    images_dir: Path,
+    output_dir: Path,
+    generate_masks: bool = True,
+    mask_overexposure: bool = False,
+    yolo_model_path: str = "yolo11m-seg.pt",
+    yolo_classes: Optional[List[int]] = None,
+    yolo_conf: float = 0.25,
+    invert_mask: bool = False,
+    overexposure_threshold: int = 250,
+    overexposure_dilate: int = 5,
+    mask_engine: str = "yolo",
+    sam3_model_path: str = "sam3.pt",
+    sam3_concepts: Optional[List[str]] = None,
+    sam3_conf: float = 0.25,
+    sam3_half: bool = True,
+    max_images: Optional[int] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Run only the mask generation pipeline on an image folder.
+
+    No Metashape XML or PLY required. Scans all images in ``images_dir``,
+    generates binary masks using YOLO / SAM3 / overexposure detection and
+    writes them to ``output_dir/masks/``.
+
+    Returns a dict with processing statistics.
+    """
+    do_masking = generate_masks or mask_overexposure
+    if not do_masking:
+        raise ValueError("At least one of generate_masks or mask_overexposure must be enabled.")
+
+    if not HAS_IMAGE_LIBS:
+        raise ImportError(
+            "Mask generation requires Pillow and OpenCV. "
+            "Install with: pip install pillow opencv-python"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    masks_output_dir = output_dir / "masks"
+    masks_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load model(s) once before the image loop.
+    yolo_model_instance = None
+    sam3_model_instance = None
+    yolo_class_ids = yolo_classes if yolo_classes else [0]
+
+    if generate_masks:
+        if mask_engine == "sam3":
+            if not HAS_SAM3:
+                raise ImportError(
+                    "--mask-engine sam3 requires ultralytics. "
+                    "Install with: pip install ultralytics"
+                )
+            if verbose:
+                print(f"Loading SAM3 model: {sam3_model_path}")
+            sam3_model_instance = _lfs_load_open_vocab_model(
+                sam3_model_path, conf=sam3_conf, half=sam3_half
+            )
+            if verbose:
+                is_native = (
+                    _SAM3SemanticPredictor is not None
+                    and isinstance(sam3_model_instance, _SAM3SemanticPredictor)
+                )
+                print(f"  Backend: {'SAM3SemanticPredictor (Meta SAM3)' if is_native else 'YOLOE/YOLOWorld'}")
+            # SAM3SemanticPredictor handles FP16/CUDA via its overrides at init.
+            # For YOLOE-family models, apply FP16 manually after loading.
+            if sam3_half and not (
+                _SAM3SemanticPredictor is not None
+                and isinstance(sam3_model_instance, _SAM3SemanticPredictor)
+            ):
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        sam3_model_instance.to("cuda").half()
+                        if verbose:
+                            print("  SAM3: FP16 enabled on CUDA")
+                except Exception:
+                    pass
+        else:
+            if not HAS_YOLO:
+                raise ImportError(
+                    "--generate-masks requires ultralytics. "
+                    "Install with: pip install ultralytics"
+                )
+            if verbose:
+                print(f"Loading YOLO model: {yolo_model_path}")
+            yolo_model_instance = _YOLO(yolo_model_path)
+
+    # Collect images.
+    image_extensions = [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp"]
+    image_files: List[Path] = []
+    for ext in image_extensions:
+        image_files.extend(images_dir.glob(f"*{ext}"))
+        image_files.extend(images_dir.glob(f"*{ext.upper()}"))
+    image_files = sorted(set(image_files))
+
+    if max_images is not None:
+        image_files = image_files[:max_images]
+
+    if verbose:
+        print(f"Found {len(image_files)} images in {images_dir}")
+        print(f"Masks will be written to: {masks_output_dir}")
+
+    num_processed = 0
+    num_skipped = 0
+
+    for src_image in image_files:
+        mask_name = src_image.stem + ".png"
+        mask_path_file = masks_output_dir / mask_name
+
+        if mask_path_file.exists():
+            if verbose:
+                print(f"  Skipping (mask exists): {mask_name}")
+            num_skipped += 1
+            continue
+
+        try:
+            pil_img = _PILImage.open(str(src_image)).convert("RGB")
+        except Exception as exc:
+            if verbose:
+                print(f"  Warning: cannot open {src_image.name}: {exc}")
+            num_skipped += 1
+            continue
+
+        if mask_engine == "sam3":
+            mask_img = _lfs_generate_mask_sam3(
+                pil_img,
+                sam3_model_instance,
+                concepts=sam3_concepts or [],
+                conf=sam3_conf,
+                invert_mask=invert_mask,
+                mask_overexposure=mask_overexposure,
+                overexposure_threshold=overexposure_threshold,
+                overexposure_dilate=overexposure_dilate,
+            )
+        else:
+            mask_img = _lfs_generate_mask(
+                pil_img,
+                yolo_model_instance,
+                yolo_conf=yolo_conf,
+                invert_mask=invert_mask,
+                class_ids=yolo_class_ids,
+                mask_overexposure=mask_overexposure,
+                overexposure_threshold=overexposure_threshold,
+                overexposure_dilate=overexposure_dilate,
+            )
+
+        mask_img.save(str(mask_path_file))
+        num_processed += 1
+
+        if verbose and num_processed % 50 == 0:
+            print(f"  {num_processed}/{len(image_files)} masks generated…")
+
+    if verbose:
+        print(f"\nMask-only complete: {num_processed} masks generated, {num_skipped} skipped.")
+        print(f"Output: {masks_output_dir}")
+
+    return {
+        "num_processed": num_processed,
+        "num_skipped": num_skipped,
+        "masks_dir": str(masks_output_dir),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Metashape XML + PLY to LichtFeld transforms.json format",
@@ -893,10 +1256,13 @@ Examples:
         """
     )
     
+    parser.add_argument("--mask-only", action="store_true",
+                        help="Run mask generation only (no XML/PLY required). "
+                             "Scans --images folder and writes masks to --output/masks/.")
     parser.add_argument("--images", type=Path, required=True,
                         help="Directory containing source images")
-    parser.add_argument("--xml", type=Path, required=True,
-                        help="Path to Metashape cameras.xml file")
+    parser.add_argument("--xml", type=Path, default=None,
+                        help="Path to Metashape cameras.xml file (not required with --mask-only)")
     parser.add_argument("--ply", type=Path, default=None,
                         help="Optional path to point cloud PLY file")
     parser.add_argument("--output", type=Path, default=None,
@@ -938,6 +1304,19 @@ Examples:
                         help="Per-channel brightness to classify a pixel as overexposed (default: 250)")
     parser.add_argument("--overexposure-dilate", type=int, default=5,
                         help="Dilation radius in pixels for the overexposure mask (default: 5)")
+    # --- Mask engine selection ---
+    parser.add_argument("--mask-engine", type=str, default="yolo", choices=["yolo", "sam3"],
+                        help="Mask generation engine: 'yolo' (class IDs, default) or "
+                             "'sam3' (open-vocabulary text concepts, requires 8 GB+ VRAM)")
+    parser.add_argument("--sam3-model", type=str, default="sam3.pt",
+                        help="Path to the SAM3/open-vocabulary model weights file (default: sam3.pt)")
+    parser.add_argument("--sam3-concepts", type=str, default="",
+                        help="Comma-separated text concepts for SAM3 to detect and mask "
+                             "(e.g. 'person,moving car,tourist'). Used only with --mask-engine sam3")
+    parser.add_argument("--sam3-conf", type=float, default=0.25,
+                        help="SAM3 detection confidence threshold 0–1 (default: 0.25)")
+    parser.add_argument("--no-sam3-half", action="store_true",
+                        help="Disable FP16 half-precision for SAM3 (increases VRAM usage)")
 
     args = parser.parse_args()
 
@@ -960,10 +1339,51 @@ Examples:
             print(f"Error: --yolo-classes must be comma-separated integers, got: {args.yolo_classes}")
             return 1
 
+    # Parse SAM3 text concepts (comma-separated strings)
+    sam3_concepts_list: Optional[List[str]] = None
+    if args.sam3_concepts:
+        sam3_concepts_list = [c.strip() for c in args.sam3_concepts.split(",") if c.strip()]
+
     if not args.images.is_dir():
         print(f"Error: Images directory not found: {args.images}")
         return 1
-    
+
+    # --- Mask-only mode: no XML/PLY needed ---
+    if args.mask_only:
+        output_dir = args.output if args.output else args.images.parent / (args.images.name + "_masks")
+        try:
+            result = run_mask_only(
+                images_dir=args.images,
+                output_dir=output_dir,
+                generate_masks=args.generate_masks,
+                mask_overexposure=args.mask_overexposure,
+                yolo_model_path=args.yolo_model,
+                yolo_classes=yolo_classes_list,
+                yolo_conf=args.yolo_conf,
+                invert_mask=args.invert_mask,
+                overexposure_threshold=args.overexposure_threshold,
+                overexposure_dilate=args.overexposure_dilate,
+                mask_engine=args.mask_engine,
+                sam3_model_path=args.sam3_model,
+                sam3_concepts=sam3_concepts_list,
+                sam3_conf=args.sam3_conf,
+                sam3_half=not args.no_sam3_half,
+                max_images=args.max_images,
+                verbose=not args.quiet,
+            )
+            if not args.quiet:
+                print(f"  Masks generated: {result['num_processed']}")
+                print(f"  Skipped: {result['num_skipped']}")
+                print(f"  Output: {result['masks_dir']}")
+            return 0
+        except Exception as e:
+            print(f"Error: {e}")
+            return 1
+
+    if args.xml is None:
+        print("Error: --xml is required unless --mask-only is specified.")
+        return 1
+
     if not args.xml.is_file():
         print(f"Error: XML file not found: {args.xml}")
         return 1
@@ -994,6 +1414,11 @@ Examples:
             mask_overexposure=args.mask_overexposure,
             overexposure_threshold=args.overexposure_threshold,
             overexposure_dilate=args.overexposure_dilate,
+            mask_engine=args.mask_engine,
+            sam3_model_path=args.sam3_model,
+            sam3_concepts=sam3_concepts_list,
+            sam3_conf=args.sam3_conf,
+            sam3_half=not args.no_sam3_half,
         )
         
         if not args.quiet:

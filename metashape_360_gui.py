@@ -170,7 +170,9 @@ UI_TEXT = {
         "mode_colmap": "COLMAP / PostShot (cubemap crops)",
         "mode_lfs": "Licht-Feld Studio (transforms.json)",
         "mode_sharp_frame": "Sharp Frame Only (no XML/3D)",
+        "mode_mask_only": "Mask Only (no XML/3D)",
         "tip_mode_sharp_frame": "Scan an image folder and select only the sharpest frames. No Metashape XML or PLY file required. Requires: pip install sharp-frames",
+        "tip_mode_mask_only": "Run YOLO / SAM3 / overexposure masking on an image folder without any Metashape XML or PLY. Masks are saved to output/masks/.",
         "fix_upside_down": "Fix upside-down orientation (+90° X rotation)",
         "tip_fix_upside_down": "Apply +90° rotation around X-axis to correct upside-down scenes in LFS",
         "lfs_copy_images": "Copy images to output folder",
@@ -315,6 +317,8 @@ UI_TEXT = {
         "mode_lfs": "Licht-Feld Studio (transforms.json)",
         "mode_sharp_frame": "シャープフレームのみ (XML/3D不要)",
         "tip_mode_sharp_frame": "画像フォルダをスキャンして最もシャープなフレームのみを選択します。Metashape XMLもPLYも不要です。要件: pip install sharp-frames",
+        "mode_mask_only": "マスクのみ (XML/3D不要)",
+        "tip_mode_mask_only": "MetashapeのXMLやPLYなしで、画像フォルダにYOLO / SAM3 / 過露出マスクを適用します。マスクは output/masks/ に保存されます。",
         "fix_upside_down": "上下反転を修正 (+90° X軸回転)",
         "tip_fix_upside_down": "LFSで逆さまのシーンを補正するX軸+90°回転を適用",
         "lfs_copy_images": "画像を出力フォルダにコピー",
@@ -604,6 +608,16 @@ class Metashape360GUI:
         )
         rb_sf.pack(side="left", padx=10)
         ToolTip(rb_sf, self.t("tip_mode_sharp_frame"))
+
+        rb_mask_only = ttk.Radiobutton(
+            mode_frame,
+            text=self.t("mode_mask_only"),
+            variable=self.var_output_mode,
+            value="MASK_ONLY",
+            command=self.toggle_mode_ui,
+        )
+        rb_mask_only.pack(side="left", padx=10)
+        ToolTip(rb_mask_only, self.t("tip_mode_mask_only"))
 
         # ===== Video Frame Extraction Section =====
         self.vid_lf = vid_lf = ttk.LabelFrame(scrollable_frame, text=self.t("vid_section"), padding=8)
@@ -1259,6 +1273,7 @@ class Metashape360GUI:
         mode = self.var_output_mode.get()
         is_colmap = mode == "COLMAP"
         is_sharp_only = mode == "SHARP_FRAME"
+        is_mask_only = mode == "MASK_ONLY"
 
         # ── Sharp Frame Only mode: simplified two-phase UI.
         #    Hide XML/PLY/Output path rows and the processing/cubemap/mask tabs.
@@ -1325,6 +1340,31 @@ class Metashape360GUI:
         if hasattr(self, "adv_toggle_btn"):
             self.adv_toggle_btn.config(state="normal")
         self._set_widget_tree_state(self.adv_content_frame, "normal")
+
+        # Re-enable all notebook tabs (may have been disabled by MASK_ONLY mode).
+        for _tab in (self.cubemap_tab, self.proc_tab, self.mask_tab):
+            self.options_notebook.tab(_tab, state="normal")
+
+        # ── Mask Only mode: no XML/PLY needed; only the Mask tab is relevant. ──
+        if is_mask_only:
+            for w in (getattr(self, "paths_xml_widgets", []) +
+                      getattr(self, "paths_ply_widgets", [])):
+                w.grid_remove()
+            for w in getattr(self, "paths_out_widgets", []):
+                w.grid()
+            self.options_notebook.tab(self.cubemap_tab, state="disabled")
+            self.options_notebook.tab(self.proc_tab, state="disabled")
+            self.options_notebook.select(self.mask_tab)
+            self.lbl_mask_lfs_note.grid_remove()
+            self.yolo_enable_cb.config(state="normal")
+            self.overexp_enable_cb.config(state="normal")
+            self.toggle_mask_options()
+            self.toggle_mask_engine()
+            self.toggle_overexposure_options()
+            if hasattr(self, "adv_toggle_btn"):
+                self.adv_toggle_btn.config(state="disabled")
+            self._set_widget_tree_state(self.adv_content_frame, "disabled")
+            return
 
         # Notebook is visible; adjust per-widget state instead.
 
@@ -1481,6 +1521,39 @@ class Metashape360GUI:
         
         self.log(f"{self.t('reset_done')}\n")
     
+    def _build_mask_only_cmd(self, images_override=None) -> list:
+        """Build command arguments for metashape_360_lfs.py --mask-only."""
+        cmd = self._get_base_python_cmd("metashape_360_lfs.py")
+        images = images_override if images_override else self.var_images.get()
+        cmd.extend(["--mask-only"])
+        cmd.extend(["--images", images])
+        cmd.extend(["--output", self.var_output.get()])
+        cmd.extend(["--max-images", str(self.var_max_images.get())])
+        if self.var_generate_masks.get():
+            cmd.append("--generate-masks")
+            cmd.extend(["--mask-engine", self.var_mask_engine.get()])
+            if self.var_mask_engine.get() == "sam3":
+                cmd.extend(["--sam3-model", self.var_sam3_model.get()])
+                cmd.extend(["--sam3-concepts", self.var_sam3_concepts.get()])
+                cmd.extend(["--sam3-conf", str(self.var_sam3_conf.get())])
+                if not self.var_sam3_half.get():
+                    cmd.append("--no-sam3-half")
+            else:
+                cmd.extend(["--yolo-model", self.var_yolo_model.get()])
+                yolo_cls = self.var_yolo_classes.get().strip()
+                if yolo_cls:
+                    cmd.extend(["--yolo-classes", yolo_cls])
+                cmd.extend(["--yolo-conf", str(self.var_yolo_conf.get())])
+            if self.var_invert_mask.get():
+                cmd.append("--invert-mask")
+        if self.var_mask_overexposure.get():
+            cmd.append("--mask-overexposure")
+            cmd.extend(["--overexposure-threshold", str(self.var_overexposure_threshold.get())])
+            cmd.extend(["--overexposure-dilate", str(self.var_overexposure_dilate.get())])
+        if self.var_quiet.get():
+            cmd.append("--quiet")
+        return cmd
+
     def build_command(self, images_override=None):
         """Build the command line arguments based on the selected output mode."""
         mode = self.var_output_mode.get()
@@ -1488,6 +1561,8 @@ class Metashape360GUI:
             return self._build_lfs_cmd(images_override=images_override)
         if mode == "SHARP_FRAME":
             return self._build_sharp_frame_standalone_cmd(images_override=images_override)
+        if mode == "MASK_ONLY":
+            return self._build_mask_only_cmd(images_override=images_override)
         return self._build_colmap_cmd(images_override=images_override)
 
     def _get_base_python_cmd(self, script_name: str) -> list:
@@ -1805,7 +1880,12 @@ class Metashape360GUI:
         """Validate required inputs before running."""
         errors = []
 
-        video_active = self.var_video_enabled.get()
+        # Video extraction is only active in SHARP_FRAME mode; the section is hidden
+        # in COLMAP/LFS mode. Guard against stale True values from a previous mode.
+        mode = self.var_output_mode.get()
+        is_sharp_only = mode == "SHARP_FRAME"
+        is_mask_only = mode == "MASK_ONLY"
+        video_active = is_sharp_only and self.var_video_enabled.get()
         if video_active:
             if not self.var_video_path.get().strip():
                 errors.append(self.t("err_video_required"))
@@ -1817,9 +1897,7 @@ class Metashape360GUI:
             elif not Path(self.var_images.get()).exists():
                 errors.append(self.t("err_images_missing", path=self.var_images.get()))
 
-        is_sharp_only = self.var_output_mode.get() == "SHARP_FRAME"
-
-        if not is_sharp_only:
+        if not is_sharp_only and not is_mask_only:
             if not self.var_xml.get().strip():
                 errors.append(self.t("err_xml_required"))
             elif not Path(self.var_xml.get()).exists():
@@ -1828,7 +1906,7 @@ class Metashape360GUI:
         if not is_sharp_only and not self.var_output.get().strip():
             errors.append(self.t("err_output_required"))
 
-        if not is_sharp_only and self.var_ply.get().strip() and not Path(self.var_ply.get()).exists():
+        if not is_sharp_only and not is_mask_only and self.var_ply.get().strip() and not Path(self.var_ply.get()).exists():
             errors.append(self.t("err_ply_missing", path=self.var_ply.get()))
 
         if errors:
@@ -1989,11 +2067,15 @@ class Metashape360GUI:
             images_override = None
             sep = "=" * 50
 
-            video_active = self.var_video_enabled.get()
             is_sharp_only = self.var_output_mode.get() == "SHARP_FRAME"
-            # In SHARP_FRAME mode the sharp-frame step IS the main step,
-            # so skip it as a pre-filter to avoid running it twice.
-            sf_active = self.var_sharp_frame_enabled.get() and not is_sharp_only
+            # Video extraction and sharp-frame pre-filtering are only applicable in
+            # SHARP_FRAME mode. Their UI sections are hidden in COLMAP/LFS modes, so
+            # stale True values from a previous mode must not trigger these steps.
+            video_active = is_sharp_only and self.var_video_enabled.get()
+            # In SHARP_FRAME mode the sharp-frame command IS the main conversion step
+            # (built by build_command), so it must not also run as a pre-filter.
+            # In COLMAP/LFS modes the section is hidden — sf_active is always False.
+            sf_active = False
             total_steps = int(video_active) + int(sf_active) + 1
             current_step = 1
 

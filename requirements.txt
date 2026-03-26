@@ -7,7 +7,8 @@ opencv-python>=4.8
 open3d>=0.17
 
 # Optional: AI masking (YOLO segmentation and SAM3)
-ultralytics>=8.0
+ultralytics>=8.3
+timm>=0.9
 
 # Optional: PLY fallback if open3d is not installed
  plyfile>=0.8
