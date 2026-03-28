@@ -69,6 +69,8 @@ DEFAULTS = {
     "video_start_time": 0.0,
     "video_end_time": 0.0,
     "video_output": "",
+    "image_format": "png",
+    "jpeg_quality": 95,
 }
 
 VALID_DIRECTIONS = ["top", "front", "right", "back", "left", "bottom"]
@@ -226,6 +228,12 @@ UI_TEXT = {
         "sf_run_extract": "▶ Run Phase 1: Extract Frames",
         "sf_run_sharpen": "▶ Run Phase 2: Select Sharp Frames",
         "sf_only_images_note": "Source: Images Folder (or extracted from video above)",
+        "image_format_label": "Output Format:",
+        "image_format_png": "PNG (lossless)",
+        "image_format_jpg": "JPEG",
+        "jpeg_quality_label": "JPEG Quality:",
+        "tip_image_format": "Output image format: PNG (lossless) or JPEG (smaller file size)",
+        "tip_jpeg_quality": "JPEG compression quality (1-100). Higher = better quality, larger file",
     },
     "JP": {
         "app_title": "Metashape 360° to COLMAP コンバーター",
@@ -372,6 +380,12 @@ UI_TEXT = {
         "sf_run_extract": "▶ フェーズ1実行: フレーム抽出",
         "sf_run_sharpen": "▶ フェーズ2実行: シャープフレーム選択",
         "sf_only_images_note": "入力: 画像フォルダ (または上の動画から抽出)",
+        "image_format_label": "出力フォーマット:",
+        "image_format_png": "PNG (ロスレス)",
+        "image_format_jpg": "JPEG",
+        "jpeg_quality_label": "JPEG品質:",
+        "tip_image_format": "出力画像フォーマット: PNG (ロスレス・大容量) または JPEG (小容量・非可逆)",
+        "tip_jpeg_quality": "JPEG圧縮品質 (1〜100)。高いほど高品質・大容量",
     },
 }
 
@@ -507,6 +521,9 @@ class Metashape360GUI:
         self.var_video_start_time = tk.DoubleVar(value=DEFAULTS["video_start_time"])
         self.var_video_end_time = tk.DoubleVar(value=DEFAULTS["video_end_time"])
         self.var_video_output = tk.StringVar(value=DEFAULTS["video_output"])
+        # Image output format
+        self.var_image_format = tk.StringVar(value=DEFAULTS["image_format"])
+        self.var_jpeg_quality = tk.IntVar(value=DEFAULTS["jpeg_quality"])
 
     def t(self, key, **kwargs):
         """Get localized UI text."""
@@ -951,6 +968,34 @@ class Metashape360GUI:
                   foreground="gray").grid(row=2, column=0, columnspan=7, sticky="w",
                                          padx=5, pady=(2, 0))
 
+        # Row 3: image format radio buttons + JPEG quality slider
+        ttk.Label(self.cubemap_inner_frame, text=self.t("image_format_label")).grid(
+            row=3, column=0, sticky="w", padx=5, pady=(8, 0))
+        fmt_frame = ttk.Frame(self.cubemap_inner_frame)
+        fmt_frame.grid(row=3, column=1, columnspan=6, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(fmt_frame, text=self.t("image_format_png"),
+                        variable=self.var_image_format, value="png",
+                        command=self.toggle_image_format).pack(side="left", padx=4)
+        ttk.Radiobutton(fmt_frame, text=self.t("image_format_jpg"),
+                        variable=self.var_image_format, value="jpg",
+                        command=self.toggle_image_format).pack(side="left", padx=4)
+        ToolTip(fmt_frame, self.t("tip_image_format"))
+
+        self.jpeg_quality_frame = ttk.Frame(self.cubemap_inner_frame)
+        self.jpeg_quality_frame.grid(row=4, column=0, columnspan=7, sticky="w", padx=5, pady=(2, 0))
+        ttk.Label(self.jpeg_quality_frame, text=self.t("jpeg_quality_label")).pack(side="left", padx=5)
+        self.jpeg_quality_label_val = ttk.Label(self.jpeg_quality_frame,
+                                                text=str(self.var_jpeg_quality.get()), width=4)
+        self.jpeg_quality_slider = ttk.Scale(
+            self.jpeg_quality_frame, from_=1, to=100,
+            variable=self.var_jpeg_quality, orient="horizontal", length=200,
+            command=lambda v: self.jpeg_quality_label_val.config(text=str(int(float(v))))
+        )
+        self.jpeg_quality_slider.pack(side="left", padx=4)
+        self.jpeg_quality_label_val.pack(side="left")
+        ToolTip(self.jpeg_quality_slider, self.t("tip_jpeg_quality"))
+        self.toggle_image_format()
+
         # --- Mask generation tab (COLMAP-only; informational note shown in LFS) ---
         self.lbl_mask_lfs_note = ttk.Label(
             mask_tab, text=self.t("lfs_mask_note"), foreground="gray"
@@ -1268,6 +1313,13 @@ class Metashape360GUI:
         for cb in self.skip_dir_checkbuttons.values():
             cb.config(state=state)
 
+    def toggle_image_format(self):
+        """Show/hide JPEG quality slider depending on selected image format."""
+        if self.var_image_format.get() == "jpg":
+            self.jpeg_quality_frame.grid()
+        else:
+            self.jpeg_quality_frame.grid_remove()
+
     def toggle_mode_ui(self):
         """Enable/disable widgets based on the selected output mode."""
         mode = self.var_output_mode.get()
@@ -1494,6 +1546,8 @@ class Metashape360GUI:
         self.var_apply_component.set(DEFAULTS["apply_component_transform"])
         self.var_quiet.set(DEFAULTS["quiet"])
         self.var_output_mode.set(DEFAULTS["output_mode"])
+        self.var_image_format.set(DEFAULTS["image_format"])
+        self.var_jpeg_quality.set(DEFAULTS["jpeg_quality"])
 
         for d in VALID_DIRECTIONS:
             self.var_skip_directions[d].set(False)
@@ -1643,6 +1697,10 @@ class Metashape360GUI:
 
         if self.var_quiet.get():
             cmd.append("--quiet")
+
+        cmd.extend(["--image-format", self.var_image_format.get()])
+        if self.var_image_format.get() == "jpg":
+            cmd.extend(["--jpeg-quality", str(self.var_jpeg_quality.get())])
 
         return cmd
 
@@ -2310,6 +2368,8 @@ class Metashape360GUI:
             f"apply-component-transform-for-ply={self.var_apply_component.get()}",
             f"quiet={self.var_quiet.get()}",
             f"output-mode={self.var_output_mode.get()}",
+            f"image-format={self.var_image_format.get()}",
+            f"jpeg-quality={self.var_jpeg_quality.get()}",
             f"language={self.var_language.get()}",
             "",
             f"sharp-frame-enabled={self.var_sharp_frame_enabled.get()}",
@@ -2456,6 +2516,13 @@ class Metashape360GUI:
             self.var_quiet.set(parse_bool(config["quiet"]))
         if "output-mode" in config and config["output-mode"] in ("COLMAP", "LFS", "SHARP_FRAME"):
             self.var_output_mode.set(config["output-mode"])
+        if "image-format" in config and config["image-format"] in ("png", "jpg"):
+            self.var_image_format.set(config["image-format"])
+        if "jpeg-quality" in config:
+            try:
+                self.var_jpeg_quality.set(int(config["jpeg-quality"]))
+            except ValueError:
+                pass
         if "language" in config and config["language"] in UI_TEXT:
             self.var_language.set(config["language"])
 

@@ -529,6 +529,8 @@ def crop_and_save_image(
     mask_image_path: Optional[str] = None,
     output_mask_path: Optional[str] = None,
     yaw_offset: float = 0.0,
+    image_format: str = "png",
+    jpeg_quality: int = 95,
 ) -> Tuple[str, str, str, np.ndarray]:
     """Crop equirectangular image and save. Optionally crop and save mask from file path. Returns (direction, output_name, output_path, metadata)."""
     equirect_image = Image.open(image_path)
@@ -543,7 +545,10 @@ def crop_and_save_image(
         flip_vertical=flip_vertical,
         yaw_offset=yaw_offset,
     )
-    cropped.save(output_image_path, compress_level=0)
+    if image_format == "jpg":
+        cropped.save(output_image_path, quality=jpeg_quality, subsampling=0)
+    else:
+        cropped.save(output_image_path, compress_level=0)
     
     # Crop and save mask if provided
     if mask_image_path is not None and output_mask_path is not None:
@@ -684,6 +689,7 @@ def convert_metashape_to_colmap(
     range_images: Optional[Tuple[int, int]] = None,
     yolo_classes: Optional[list] = None,
     rotate_z180: bool = False,
+    ply_filter_outliers: bool = False,
     mask_overexposure: bool = False,
     overexposure_threshold: int = 250,
     overexposure_dilate: int = 5,
@@ -691,6 +697,8 @@ def convert_metashape_to_colmap(
     sam3_concepts: Optional[list] = None,
     sam3_conf: float = 0.25,
     sam3_half: bool = True,
+    image_format: str = "png",
+    jpeg_quality: int = 95,
 ) -> Dict[str, Any]:
     """Convert Metashape equirectangular data to COLMAP format.
     
@@ -890,8 +898,9 @@ def convert_metashape_to_colmap(
         current_yaw_offset = frame_index * yaw_offset_per_frame
 
         # Queue tasks for each direction
+        image_ext = "jpg" if image_format == "jpg" else "png"
         for direction in directions:
-            output_image_name = f"{base_name}_{direction}.png"
+            output_image_name = f"{base_name}_{direction}.{image_ext}"
             output_image_path = str(images_output_dir / output_image_name)
             crop_tasks.append((str(src_image_path), direction, crop_size, output_image_path, fov_deg, flip_vertical, current_yaw_offset))
             camera_metadata.append((base_name, direction, R_c2w, t_c2w, current_yaw_offset))
@@ -1058,6 +1067,8 @@ def convert_metashape_to_colmap(
                         mask_file_path,
                         output_mask_path,
                         yaw_offset_val,
+                        image_format,
+                        jpeg_quality,
                     )
                 )
 
@@ -1097,7 +1108,8 @@ def convert_metashape_to_colmap(
 
     # Build images_colmap from results
     for idx, (base_name, direction, R_c2w, t_c2w, yaw_offset) in enumerate(camera_metadata):
-        output_image_name = f"{base_name}_{direction}.png"
+        image_ext = "jpg" if image_format == "jpg" else "png"
+        output_image_name = f"{base_name}_{direction}.{image_ext}"
         
         R_dir = get_direction_rotation_matrix(direction)
         
@@ -1205,6 +1217,19 @@ def convert_metashape_to_colmap(
             if verbose:
                 print("  Applied 180° Z-axis rotation to point cloud (for PostShot)")
 
+        # Remove statistical outliers to avoid inflating the scene bounding box
+        if ply_filter_outliers:
+            pc.points = o3d.utility.Vector3dVector(points3d)
+            if colors is not None:
+                pc.colors = o3d.utility.Vector3dVector(colors)
+            pc_clean, inlier_mask = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            n_before = len(points3d)
+            points3d = np.asarray(pc_clean.points)
+            colors = np.asarray(pc_clean.colors) if pc_clean.has_colors() else None
+            n_removed = n_before - len(points3d)
+            if verbose:
+                print(f"  Outlier removal: removed {n_removed} points ({n_removed/n_before*100:.2f}%), kept {len(points3d)}")
+
         for idx, point in enumerate(points3d, start=1):
             x, y, z = point
             if colors is not None:
@@ -1220,6 +1245,8 @@ def convert_metashape_to_colmap(
 
         output_ply = output_dir / "points3D.ply"
         pc.points = o3d.utility.Vector3dVector(points3d)
+        if colors is not None:
+            pc.colors = o3d.utility.Vector3dVector(colors)
         o3d.io.write_point_cloud(str(output_ply), pc)
         if verbose:
             print(f"  Wrote transformed point cloud to {output_ply}")
@@ -1476,6 +1503,12 @@ def main() -> int:
         help="Disable Z-axis 180° rotation"
     )
     parser.add_argument(
+        "--ply-filter-outliers",
+        action="store_true",
+        default=config.get("ply-filter-outliers", False) if isinstance(config.get("ply-filter-outliers"), bool) else False,
+        help="Remove statistical outliers from the PLY point cloud before writing points3D.txt. Uses open3d remove_statistical_outlier (nb_neighbors=20, std_ratio=2.0). Prevents extreme outlier points from inflating the scene bounding box in PostShot/3DGS training."
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         default=config.get("quiet", False) if isinstance(config.get("quiet"), bool) else False,
@@ -1543,6 +1576,19 @@ def main() -> int:
         action="store_false",
         dest="sam3_half",
         help="Disable FP16 for SAM3 (use full FP32)"
+    )
+    parser.add_argument(
+        "--image-format",
+        type=str,
+        choices=["png", "jpg"],
+        default=config.get("image-format", "png"),
+        help="Output image format: 'png' (lossless) or 'jpg' (smaller file size). Default: png"
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=int(config["jpeg-quality"]) if "jpeg-quality" in config else 95,
+        help="JPEG compression quality (1-100). Only used when --image-format=jpg. Higher = better quality, larger file. Default: 95"
     )
 
     args = parser.parse_args()
@@ -1634,6 +1680,7 @@ def main() -> int:
             range_images=range_images,
             yolo_classes=yolo_classes,
             rotate_z180=args.rotate_z180,
+            ply_filter_outliers=args.ply_filter_outliers,
             mask_overexposure=args.mask_overexposure,
             overexposure_threshold=args.overexposure_threshold,
             overexposure_dilate=args.overexposure_dilate,
@@ -1641,6 +1688,8 @@ def main() -> int:
             sam3_concepts=sam3_concepts,
             sam3_conf=args.sam3_conf,
             sam3_half=args.sam3_half,
+            image_format=args.image_format,
+            jpeg_quality=args.jpeg_quality,
         )
         if not args.quiet:
             print("\nConversion complete!")
