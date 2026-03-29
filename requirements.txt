@@ -11,4 +11,7 @@ ultralytics>=8.3
 timm>=0.9
 
 # Optional: PLY fallback if open3d is not installed
- plyfile>=0.8
+plyfile>=0.8
+
+# Optional: Sharp frame pre-filter (requires: pip install sharp-frames)
+sharp-frames>=0.3

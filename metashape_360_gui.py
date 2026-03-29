@@ -1614,7 +1614,8 @@ class Metashape360GUI:
         if mode == "LFS":
             return self._build_lfs_cmd(images_override=images_override)
         if mode == "SHARP_FRAME":
-            return self._build_sharp_frame_standalone_cmd(images_override=images_override)
+            cmd, _ = self._build_sharp_frame_standalone_cmd(images_override=images_override)
+            return cmd
         if mode == "MASK_ONLY":
             return self._build_mask_only_cmd(images_override=images_override)
         return self._build_colmap_cmd(images_override=images_override)
@@ -1773,19 +1774,17 @@ class Metashape360GUI:
             images_path = Path(images)
             sf_out = str(images_path.parent / (images_path.name + "_sharp"))
 
-        base = self.get_app_base_dir()
-        sf_exe = base / ".venv" / "Scripts" / "sharp-frames.exe"
+        # Resolve sharp-frames.exe relative to the running Python interpreter so it
+        # works with any venv name (env/, .venv/, etc.)
+        scripts_dir = Path(sys.executable).parent
+        sf_exe = scripts_dir / "sharp-frames.exe"
         if not sf_exe.exists():
-            sf_exe = base / ".venv" / "bin" / "sharp-frames"
+            sf_exe = scripts_dir / "sharp-frames"
         if sf_exe.exists():
             cmd = [str(sf_exe)]
         else:
-            # Fallback: run via the venv python as a module (some install layouts)
-            venv_python = base / ".venv" / "Scripts" / "python.exe"
-            if not venv_python.exists():
-                venv_python = base / ".venv" / "bin" / "python"
-            python_exe = str(venv_python) if venv_python.exists() else sys.executable
-            cmd = [python_exe, "-m", "sharp_frames"]
+            # Last-resort fallback using the current interpreter
+            cmd = [sys.executable, str(scripts_dir / "sharp-frames")]
 
         cmd.extend([images, sf_out, "--force-overwrite"])
 
@@ -1804,11 +1803,12 @@ class Metashape360GUI:
 
         return cmd, sf_out
 
-    def _build_sharp_frame_standalone_cmd(self, images_override=None) -> list:
+    def _build_sharp_frame_standalone_cmd(self, images_override=None) -> tuple:
         """Build the sharp-frames CLI command for Sharp Frame Only mode.
 
-        Uses the output folder (var_output) as the destination.
+        Uses the output folder (var_sharp_frame_output) as the destination.
         If the output folder is empty, auto-derives it from the images folder name.
+        Returns (cmd_list, output_dir_str).
         """
         images = images_override if images_override else self.var_images.get()
         out = self.var_sharp_frame_output.get().strip()
@@ -1816,19 +1816,17 @@ class Metashape360GUI:
             images_path = Path(images)
             out = str(images_path.parent / (images_path.name + "_sharp"))
 
-        base = self.get_app_base_dir()
-        sf_exe = base / ".venv" / "Scripts" / "sharp-frames.exe"
+        # Resolve sharp-frames.exe relative to the running Python interpreter so it
+        # works with any venv name (env/, .venv/, etc.)
+        scripts_dir = Path(sys.executable).parent
+        sf_exe = scripts_dir / "sharp-frames.exe"
         if not sf_exe.exists():
-            sf_exe = base / ".venv" / "bin" / "sharp-frames"
+            sf_exe = scripts_dir / "sharp-frames"
         if sf_exe.exists():
             cmd = [str(sf_exe)]
         else:
-            # Fallback: run via the venv python as a module.
-            venv_python = base / ".venv" / "Scripts" / "python.exe"
-            if not venv_python.exists():
-                venv_python = base / ".venv" / "bin" / "python"
-            python_exe = str(venv_python) if venv_python.exists() else sys.executable
-            cmd = [python_exe, "-m", "sharp_frames"]
+            # Last-resort fallback using the current interpreter
+            cmd = [sys.executable, str(scripts_dir / "sharp-frames")]
 
         cmd.extend([images, out, "--force-overwrite"])
 
@@ -1845,7 +1843,40 @@ class Metashape360GUI:
             cmd.extend(["--outlier-window-size", str(self.var_sharp_frame_window_size.get())])
             cmd.extend(["--outlier-sensitivity", str(self.var_sharp_frame_sensitivity.get())])
 
-        return cmd
+        return cmd, out
+
+    def _rename_sequential(self, folder: str) -> int:
+        """Rename image files in folder to sequential zero-padded names.
+
+        Files are sorted by their original name (preserving temporal order)
+        and renamed to 00001.ext, 00002.ext, ... using a two-pass strategy
+        to avoid collisions.
+        Returns the count of renamed files.
+        """
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"}
+        folder_path = Path(folder)
+        files = sorted(
+            f for f in folder_path.iterdir()
+            if f.is_file() and f.suffix.lower() in image_exts
+        )
+        if not files:
+            return 0
+
+        pad = len(str(len(files)))
+
+        # Pass 1: rename to temporary names to avoid source/destination collisions
+        tmp_files = []
+        for i, f in enumerate(files):
+            tmp = f.with_name(f"__seq_tmp_{i:010d}{f.suffix}")
+            f.rename(tmp)
+            tmp_files.append(tmp)
+
+        # Pass 2: rename from temp to final sequential names
+        for i, tmp in enumerate(tmp_files):
+            final = tmp.with_name(f"{str(i + 1).zfill(pad)}{tmp.suffix}")
+            tmp.rename(final)
+
+        return len(files)
 
     def _run_video_extraction(self) -> str:
         """Extract frames from a video file using cv2.
@@ -2067,7 +2098,7 @@ class Metashape360GUI:
         """Background thread for Phase 2 (sharp frame selection only)."""
         sep = "=" * 50
         try:
-            cmd = self._build_sharp_frame_standalone_cmd(images_override=images_override)
+            cmd, sf_out = self._build_sharp_frame_standalone_cmd(images_override=images_override)
             self.output_queue.put(
                 f"{sep}\n[\u2461 Phase 2] Sharp Frame Selection\n{sep}\n"
                 f"{self.t('cmd', cmd=' '.join(cmd))}\n\n"
@@ -2076,6 +2107,12 @@ class Metashape360GUI:
             self.output_queue.put(f"\n{sep}\n")
             if rc == 0:
                 self.output_queue.put("Sharp frame selection complete.\n")
+                self.output_queue.put("Renaming selected frames to sequential order...\n")
+                count = self._rename_sequential(sf_out)
+                self.output_queue.put(
+                    f"Renamed {count} files to sequential names "
+                    f"(1 – {count}) in:\n  {sf_out}\n"
+                )
             else:
                 self.output_queue.put(f"Sharp frame selection failed (exit code {rc}).\n")
         except Exception as e:
