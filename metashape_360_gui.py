@@ -1846,11 +1846,12 @@ class Metashape360GUI:
         return cmd, out
 
     def _rename_sequential(self, folder: str) -> int:
-        """Rename image files in folder to sequential zero-padded names.
+        """Rename image files in folder to the same naming convention used by Phase 1.
 
-        Files are sorted by their original name (preserving temporal order)
-        and renamed to 00001.ext, 00002.ext, ... using a two-pass strategy
-        to avoid collisions.
+        Files are sorted by their original name (preserving temporal order) and
+        renamed to frame_0001.ext, frame_0002.ext, ... matching the pattern
+        produced by _run_video_extraction, using a two-pass strategy to avoid
+        collisions when sources and destinations overlap.
         Returns the count of renamed files.
         """
         image_exts = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"}
@@ -1871,9 +1872,9 @@ class Metashape360GUI:
             f.rename(tmp)
             tmp_files.append(tmp)
 
-        # Pass 2: rename from temp to final sequential names
+        # Pass 2: rename from temp to final names matching Phase 1 convention
         for i, tmp in enumerate(tmp_files):
-            final = tmp.with_name(f"{str(i + 1).zfill(pad)}{tmp.suffix}")
+            final = tmp.with_name(f"frame_{str(i + 1).zfill(pad)}{tmp.suffix}")
             tmp.rename(final)
 
         return len(files)
