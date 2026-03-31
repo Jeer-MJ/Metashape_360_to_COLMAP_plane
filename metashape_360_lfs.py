@@ -637,6 +637,8 @@ def convert_metashape_to_lichtfeld(
     sam3_concepts: Optional[List[str]] = None,
     sam3_conf: float = 0.25,
     sam3_half: bool = True,
+    image_format: str = "png",
+    jpeg_quality: int = 95,
 ) -> Dict[str, Any]:
     """
     Convert Metashape data to LichtFeld-compatible transforms.json format.
@@ -665,6 +667,10 @@ def convert_metashape_to_lichtfeld(
                          Valid values: top, front, right, back, left, bottom.
         generate_masks: If True, run YOLO segmentation on every output image and
                         save binary masks to output_dir/masks/ (requires ultralytics).
+        image_format: Output image format for cubemap crops: 'png' (lossless) or
+                      'jpg' (smaller file size). Only used when split_cubemap=True.
+        jpeg_quality: JPEG compression quality (1-100). Only used when
+                      image_format='jpg'. Default: 95.
         yolo_model_path: Path to the YOLO segmentation model weights file.
         yolo_classes: YOLO class IDs to mask (default: [0] = person).
         yolo_conf: Minimum confidence threshold for YOLO detections (0–1).
@@ -861,11 +867,15 @@ def convert_metashape_to_lichtfeld(
                 lfs_transform = transform_camera_matrix(face_transform, fix_upside_down)
 
                 # Crop and save the perspective face image
-                output_image_name = f"{base_name}_{direction}.png"
+                image_ext = "jpg" if image_format == "jpg" else "png"
+                output_image_name = f"{base_name}_{direction}.{image_ext}"
                 output_image_path = images_output_dir / output_image_name
                 if not output_image_path.exists():
                     cropped = _lfs_crop_face(equirect_img, direction, crop_size, fov_deg)
-                    cropped.save(str(output_image_path), compress_level=0)
+                    if image_format == "jpg":
+                        cropped.save(str(output_image_path), quality=jpeg_quality, subsampling=0)
+                    else:
+                        cropped.save(str(output_image_path), compress_level=0)
                 elif do_masking:
                     # Need the crop for mask generation even when image already exists.
                     cropped = _lfs_crop_face(equirect_img, direction, crop_size, fov_deg)
@@ -1317,6 +1327,12 @@ Examples:
                         help="SAM3 detection confidence threshold 0–1 (default: 0.25)")
     parser.add_argument("--no-sam3-half", action="store_true",
                         help="Disable FP16 half-precision for SAM3 (increases VRAM usage)")
+    parser.add_argument("--image-format", type=str, choices=["png", "jpg"], default="png",
+                        help="Output image format for cubemap crops: 'png' (lossless) or 'jpg' "
+                             "(smaller file size). Only used with --split-cubemap. Default: png")
+    parser.add_argument("--jpeg-quality", type=int, default=95,
+                        help="JPEG compression quality (1-100). Only used when --image-format=jpg. "
+                             "Higher = better quality, larger file. Default: 95")
 
     args = parser.parse_args()
 
@@ -1419,6 +1435,8 @@ Examples:
             sam3_concepts=sam3_concepts_list,
             sam3_conf=args.sam3_conf,
             sam3_half=not args.no_sam3_half,
+            image_format=args.image_format,
+            jpeg_quality=args.jpeg_quality,
         )
         
         if not args.quiet:

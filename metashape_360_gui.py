@@ -733,8 +733,51 @@ class Metashape360GUI:
             command=lambda: self.browse_folder(self.var_video_output),
         ).pack(side="left", padx=5)
 
+        vid_format_row = ttk.Frame(self.vid_inner)
+        vid_format_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(vid_format_row, text=self.t("image_format_label")).pack(side="left", padx=5)
+        self.vid_format_frame = ttk.Frame(vid_format_row)
+        self.vid_format_frame.pack(side="left", padx=5)
+        ttk.Radiobutton(
+            self.vid_format_frame,
+            text=self.t("image_format_png"),
+            variable=self.var_image_format,
+            value="png",
+            command=self.toggle_image_format,
+        ).pack(side="left", padx=4)
+        ttk.Radiobutton(
+            self.vid_format_frame,
+            text=self.t("image_format_jpg"),
+            variable=self.var_image_format,
+            value="jpg",
+            command=self.toggle_image_format,
+        ).pack(side="left", padx=4)
+        ToolTip(self.vid_format_frame, self.t("tip_image_format"))
+
+        self.vid_jpeg_quality_frame = ttk.Frame(self.vid_inner)
+        self.vid_jpeg_quality_frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(self.vid_jpeg_quality_frame, text=self.t("jpeg_quality_label")).pack(side="left", padx=5)
+        self.vid_jpeg_quality_label_val = ttk.Label(
+            self.vid_jpeg_quality_frame,
+            text=str(self.var_jpeg_quality.get()),
+            width=4,
+        )
+        self.vid_jpeg_quality_slider = ttk.Scale(
+            self.vid_jpeg_quality_frame,
+            from_=1,
+            to=100,
+            variable=self.var_jpeg_quality,
+            orient="horizontal",
+            length=200,
+            command=self.update_jpeg_quality_labels,
+        )
+        self.vid_jpeg_quality_slider.pack(side="left", padx=4)
+        self.vid_jpeg_quality_label_val.pack(side="left")
+        ToolTip(self.vid_jpeg_quality_slider, self.t("tip_jpeg_quality"))
+
         self.toggle_video_mode()
         self.toggle_video_options()
+        self.toggle_image_format()
 
         # Per-phase run button (visible only in Sharp Frame Only mode)
         self.btn_sf_extract = ttk.Button(
@@ -989,7 +1032,7 @@ class Metashape360GUI:
         self.jpeg_quality_slider = ttk.Scale(
             self.jpeg_quality_frame, from_=1, to=100,
             variable=self.var_jpeg_quality, orient="horizontal", length=200,
-            command=lambda v: self.jpeg_quality_label_val.config(text=str(int(float(v))))
+            command=self.update_jpeg_quality_labels
         )
         self.jpeg_quality_slider.pack(side="left", padx=4)
         self.jpeg_quality_label_val.pack(side="left")
@@ -1313,12 +1356,27 @@ class Metashape360GUI:
         for cb in self.skip_dir_checkbuttons.values():
             cb.config(state=state)
 
+    def update_jpeg_quality_labels(self, value=None):
+        """Synchronize the visible JPEG quality labels with the current slider value."""
+        quality = str(int(float(value))) if value is not None else str(int(self.var_jpeg_quality.get()))
+        if hasattr(self, "jpeg_quality_label_val"):
+            self.jpeg_quality_label_val.config(text=quality)
+        if hasattr(self, "vid_jpeg_quality_label_val"):
+            self.vid_jpeg_quality_label_val.config(text=quality)
+
     def toggle_image_format(self):
         """Show/hide JPEG quality slider depending on selected image format."""
+        self.update_jpeg_quality_labels()
         if self.var_image_format.get() == "jpg":
-            self.jpeg_quality_frame.grid()
+            if hasattr(self, "jpeg_quality_frame"):
+                self.jpeg_quality_frame.grid()
+            if hasattr(self, "vid_jpeg_quality_frame") and not self.vid_jpeg_quality_frame.winfo_ismapped():
+                self.vid_jpeg_quality_frame.pack(fill="x", pady=(4, 0))
         else:
-            self.jpeg_quality_frame.grid_remove()
+            if hasattr(self, "jpeg_quality_frame"):
+                self.jpeg_quality_frame.grid_remove()
+            if hasattr(self, "vid_jpeg_quality_frame") and self.vid_jpeg_quality_frame.winfo_ismapped():
+                self.vid_jpeg_quality_frame.pack_forget()
 
     def toggle_mode_ui(self):
         """Enable/disable widgets based on the selected output mode."""
@@ -1571,6 +1629,7 @@ class Metashape360GUI:
         self.var_video_end_time.set(DEFAULTS["video_end_time"])
         self.var_video_output.set(DEFAULTS["video_output"])
 
+        self.toggle_image_format()
         self.toggle_mode_ui()
         
         self.log(f"{self.t('reset_done')}\n")
@@ -1631,10 +1690,17 @@ class Metashape360GUI:
             return [str(exe)]
 
         script_path = self.get_app_base_dir() / script_name
-        venv_python = self.get_app_base_dir() / ".venv" / "Scripts" / "python.exe"
-        if not venv_python.exists():
-            venv_python = self.get_app_base_dir() / ".venv" / "bin" / "python"
-        python_exe = str(venv_python) if venv_python.exists() else sys.executable
+        python_candidates = [
+            self.get_app_base_dir() / "env" / "Scripts" / "python.exe",
+            self.get_app_base_dir() / ".venv" / "Scripts" / "python.exe",
+            self.get_app_base_dir() / "env" / "bin" / "python",
+            self.get_app_base_dir() / ".venv" / "bin" / "python",
+        ]
+        python_exe = sys.executable
+        for candidate in python_candidates:
+            if candidate.exists():
+                python_exe = str(candidate)
+                break
         return [python_exe, "-u", str(script_path)]
 
     def _build_colmap_cmd(self, images_override=None) -> list:
@@ -1760,6 +1826,10 @@ class Metashape360GUI:
             cmd.append("--mask-overexposure")
             cmd.extend(["--overexposure-threshold", str(self.var_overexposure_threshold.get())])
             cmd.extend(["--overexposure-dilate", str(self.var_overexposure_dilate.get())])
+
+        cmd.extend(["--image-format", self.var_image_format.get()])
+        if self.var_image_format.get() == "jpg":
+            cmd.extend(["--jpeg-quality", str(self.var_jpeg_quality.get())])
 
         return cmd
 
@@ -1889,6 +1959,9 @@ class Metashape360GUI:
 
         video_path = self.var_video_path.get().strip()
         vid_out = self.var_video_output.get().strip()
+        image_format = self.var_image_format.get().lower()
+        if image_format not in ("png", "jpg"):
+            image_format = "png"
         if not vid_out:
             vid_out = str(Path(video_path).parent / (Path(video_path).stem + "_frames"))
 
@@ -1907,6 +1980,8 @@ class Metashape360GUI:
             f"  File: {Path(video_path).name}\n"
             f"  Duration: {duration:.1f}s  |  Total frames: {total_frames}"
             f"  |  Native FPS: {native_fps:.3f}\n"
+            f"  Output format: {image_format.upper()}"
+            f"{f'  |  JPEG quality: {int(self.var_jpeg_quality.get())}' if image_format == 'jpg' else ''}\n"
             f"  Output: {vid_out}\n\n"
         )
 
@@ -1942,8 +2017,17 @@ class Metashape360GUI:
                 break
             if current_pos in frames_to_extract:
                 extracted += 1
-                fname = out_dir / f"frame_{extracted:0{n_digits}d}.jpg"
-                _cv2.imwrite(str(fname), frame, [_cv2.IMWRITE_JPEG_QUALITY, 95])
+                fname = out_dir / f"frame_{extracted:0{n_digits}d}.{image_format}"
+                if image_format == "jpg":
+                    ok = _cv2.imwrite(
+                        str(fname),
+                        frame,
+                        [_cv2.IMWRITE_JPEG_QUALITY, int(self.var_jpeg_quality.get())],
+                    )
+                else:
+                    ok = _cv2.imwrite(str(fname), frame)
+                if not ok:
+                    raise RuntimeError(f"Failed to write extracted frame: {fname}")
                 if extracted % 100 == 0:
                     self.output_queue.put(
                         f"  Progress: {extracted}/{total_selected} frames extracted\n"
@@ -2600,6 +2684,7 @@ class Metashape360GUI:
         if "video-output" in config:
             self.var_video_output.set(config["video-output"])
 
+        self.toggle_image_format()
         self.toggle_mode_ui()
 
         self.log(f"{self.t('loaded', path=filepath)}\n")

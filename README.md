@@ -109,6 +109,8 @@ If you prefer interactive operation, launch the GUI:
 python metashape_360_gui.py
 ```
 
+On Windows, you can also launch the GUI directly with [launch_gui.bat](launch_gui.bat). It starts the app with `env\Scripts\pythonw.exe` when available, and falls back to `env\Scripts\python.exe` or `.venv` equivalents.
+
 Main points:
 - `Input/Output Paths`: Select image folder, XML, optional PLY, and output folder.
 - `Mode selector`: Switch between COLMAP and Licht-Feld Studio modes at the top of the window.
